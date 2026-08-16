@@ -1,0 +1,4 @@
+yt-dlp>=2024.12.23
+imageio-ffmpeg>=0.5.1
+curl_cffi>=0.10,<0.16
+pyinstaller>=6.0.0
