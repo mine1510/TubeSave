@@ -5,7 +5,9 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import os
 import queue
+import sys
 import threading
 import time
 import tkinter as tk
@@ -39,8 +41,7 @@ def save_settings(settings: dict) -> None:
         pass
 
 
-# Visual system — light, calm, utility-focused (no purple / no dark theme)
-COLORS = {
+LIGHT = {
     "bg": "#F7F6F3",
     "surface": "#FFFFFF",
     "border": "#E6E2DA",
@@ -56,6 +57,24 @@ COLORS = {
     "ghost_hover": "#E7E2D8",
 }
 
+DARK = {
+    "bg": "#161615",
+    "surface": "#222220",
+    "border": "#33332F",
+    "text": "#F3F1EC",
+    "muted": "#A39E96",
+    "accent": "#D4784A",
+    "accent_hover": "#E08A5C",
+    "accent_soft": "#2A2A27",
+    "track": "#2F2F2C",
+    "success": "#5A9A78",
+    "danger": "#C96A5C",
+    "ghost": "#2A2A27",
+    "ghost_hover": "#333330",
+}
+
+COLORS: dict[str, str] = dict(LIGHT)
+
 FONTS = {
     "brand": ("Segoe UI Semibold", 22),
     "title": ("Segoe UI Semibold", 12),
@@ -63,6 +82,17 @@ FONTS = {
     "small": ("Segoe UI", 9),
     "mono": ("Consolas", 9),
 }
+
+QUALITY_OPTIONS: list[tuple[str, str]] = [
+    ("best", "Лучшее"),
+    ("2160", "4K"),
+    ("1440", "1440p"),
+    ("1080", "1080p"),
+    ("720", "720p"),
+    ("480", "480p"),
+    ("360", "360p"),
+]
+QUALITY_CODES = {code for code, _label in QUALITY_OPTIONS}
 
 
 def format_duration(seconds: float | None) -> str:
@@ -236,6 +266,111 @@ class PillButton(tk.Canvas):
             self._command()
 
 
+class QualityChip(tk.Canvas):
+    def __init__(
+        self,
+        master: tk.Misc,
+        code: str,
+        label: str,
+        command,
+        *,
+        width: int = 78,
+        height: int = 32,
+    ) -> None:
+        super().__init__(
+            master,
+            width=width,
+            height=height,
+            highlightthickness=0,
+            bg=COLORS["surface"],
+            cursor="hand2",
+        )
+        self.code = code
+        self._label = label
+        self._command = command
+        self._selected = False
+        self._hover = False
+        self.bind("<Enter>", lambda _e: self._set_hover(True))
+        self.bind("<Leave>", lambda _e: self._set_hover(False))
+        self.bind("<Button-1>", lambda _e: self._command(self.code))
+        self._draw()
+
+    def set_selected(self, selected: bool) -> None:
+        self._selected = selected
+        self._draw()
+
+    def _set_hover(self, hover: bool) -> None:
+        self._hover = hover
+        self._draw()
+
+    def _draw(self) -> None:
+        self.delete("all")
+        w = int(self["width"])
+        h = int(self["height"])
+        r = h / 2
+        if self._selected:
+            color = COLORS["accent"]
+            fg = "#FFFFFF"
+        elif self._hover:
+            color = COLORS["ghost_hover"]
+            fg = COLORS["text"]
+        else:
+            color = COLORS["ghost"]
+            fg = COLORS["text"]
+        self.create_oval(0, 0, h, h, fill=color, outline="")
+        self.create_oval(w - h, 0, w, h, fill=color, outline="")
+        self.create_rectangle(r, 0, w - r, h, fill=color, outline="")
+        self.create_text(w / 2, h / 2, text=self._label, fill=fg, font=FONTS["small"])
+
+
+class ThemeToggle(tk.Canvas):
+    """Compact pill switch for light/dark theme."""
+
+    def __init__(self, master: tk.Misc, command, *, width: int = 44, height: int = 24) -> None:
+        super().__init__(
+            master,
+            width=width,
+            height=height,
+            highlightthickness=0,
+            bg=COLORS["bg"],
+            cursor="hand2",
+        )
+        self._command = command
+        self._on = False
+        self.bind("<Button-1>", self._on_click)
+        self._draw()
+
+    def set_on(self, on: bool) -> None:
+        self._on = on
+        self._draw()
+
+    def _draw(self) -> None:
+        self.delete("all")
+        w = int(self["width"])
+        h = int(self["height"])
+        pad = 2
+        track = COLORS["accent"] if self._on else COLORS["track"]
+        self.create_oval(0, 0, h, h, fill=track, outline="")
+        self.create_oval(w - h, 0, w, h, fill=track, outline="")
+        self.create_rectangle(h / 2, 0, w - h / 2, h, fill=track, outline="")
+        knob_r = (h - pad * 2) / 2
+        cx = (w - h / 2) if self._on else (h / 2)
+        cy = h / 2
+        knob = COLORS["surface"] if self._on else COLORS["muted"]
+        self.create_oval(
+            cx - knob_r,
+            cy - knob_r,
+            cx + knob_r,
+            cy + knob_r,
+            fill=knob,
+            outline="",
+        )
+
+    def _on_click(self, _event=None) -> None:
+        if self._command:
+            self._command()
+
+
 class Card(tk.Frame):
     def __init__(self, master: tk.Misc, **kwargs) -> None:
         super().__init__(
@@ -251,20 +386,40 @@ class YouTubeDownloaderApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("TubeSave")
-        self.configure(bg=COLORS["bg"])
         self.resizable(True, True)
 
         default_dir = Path.home() / "Downloads" / "YouTube"
         self._settings = load_settings()
         saved_dir = str(self._settings.get("download_dir") or "").strip()
         self.download_dir = Path(saved_dir) if saved_dir else default_dir
+        theme = str(self._settings.get("theme") or "light").lower()
+        self._theme = "dark" if theme == "dark" else "light"
+        saved_quality = str(self._settings.get("quality") or "best").strip().lower()
+        self._quality = saved_quality if saved_quality in QUALITY_CODES else "best"
+        COLORS.clear()
+        COLORS.update(DARK if self._theme == "dark" else LIGHT)
+
+        self.configure(bg=COLORS["bg"])
         self._events: queue.Queue[tuple[str, object]] = queue.Queue()
         self._is_busy = False
         self._started_at: float | None = None
         self._timer_job: str | None = None
         self._current_stage = "Ожидание"
 
+        self._bg_frames: list[tk.Misc] = []
+        self._surface_frames: list[tk.Misc] = []
+        self._cards: list[Card] = []
+        self._bg_text_labels: list[tk.Label] = []
+        self._bg_muted_labels: list[tk.Label] = []
+        self._surface_text_labels: list[tk.Label] = []
+        self._surface_muted_labels: list[tk.Label] = []
+        self._entries: list[tk.Entry] = []
+        self._pill_buttons: list[tuple[PillButton, str]] = []
+        self._quality_chips: list[QualityChip] = []
+        self._context_menus: list[tk.Menu] = []
+
         self._build_ui()
+        self._apply_theme()
         self._fit_window()
         self.after(80, self._process_events)
 
@@ -276,10 +431,18 @@ class YouTubeDownloaderApp(tk.Tk):
         self._settings["download_dir"] = folder_str
         save_settings(self._settings)
 
+    def _persist_theme(self) -> None:
+        self._settings["theme"] = self._theme
+        save_settings(self._settings)
+
+    def _persist_quality(self) -> None:
+        self._settings["quality"] = self._quality
+        save_settings(self._settings)
+
     def _fit_window(self) -> None:
         """Size window so action buttons are always visible on first open."""
         self.update_idletasks()
-        width = max(760, self.winfo_reqwidth())
+        width = max(800, self.winfo_reqwidth())
         height = max(720, self.winfo_reqheight() + 24)
         screen_w = self.winfo_screenwidth()
         screen_h = self.winfo_screenheight()
@@ -287,40 +450,82 @@ class YouTubeDownloaderApp(tk.Tk):
         height = min(height, max(560, screen_h - 100))
         x = max(0, (screen_w - width) // 2)
         y = max(0, (screen_h - height) // 3)
-        self.minsize(700, 620)
+        self.minsize(780, 700)
         self.geometry(f"{width}x{height}+{x}+{y}")
+
+    def _register_pill(self, button: PillButton, parent_key: str = "bg") -> PillButton:
+        self._pill_buttons.append((button, parent_key))
+        return button
 
     def _build_ui(self) -> None:
         root = tk.Frame(self, bg=COLORS["bg"])
         root.pack(fill="both", expand=True, padx=24, pady=20)
+        self._bg_frames.append(root)
 
         # Actions first (side=bottom) so they never get clipped by expanding content
         actions = tk.Frame(root, bg=COLORS["bg"])
         actions.pack(side="bottom", fill="x", pady=(12, 0))
+        self._bg_frames.append(actions)
 
-        self.info_btn = PillButton(actions, "Проверить", self._fetch_info, width=120)
+        self.info_btn = self._register_pill(
+            PillButton(actions, "Проверить", self._fetch_info, width=120)
+        )
         self.info_btn.pack(side="left")
 
-        self.download_btn = PillButton(
-            actions, "Скачать", self._start_download, primary=True, width=140
+        self.download_btn = self._register_pill(
+            PillButton(actions, "Скачать", self._start_download, primary=True, width=120)
         )
         self.download_btn.pack(side="left", padx=(10, 0))
 
-        exit_btn = PillButton(actions, "Выход", self.destroy, width=100)
+        self.audio_btn = self._register_pill(
+            PillButton(
+                actions,
+                "Только аудио",
+                lambda: self._start_download(audio_only=True),
+                width=130,
+            )
+        )
+        self.audio_btn.pack(side="left", padx=(10, 0))
+
+        exit_btn = self._register_pill(PillButton(actions, "Выход", self.destroy, width=100))
         exit_btn.pack(side="right")
 
         # Scrollable-feeling content above buttons
         content = tk.Frame(root, bg=COLORS["bg"])
         content.pack(side="top", fill="both", expand=True)
+        self._bg_frames.append(content)
+
+        header = tk.Frame(content, bg=COLORS["bg"])
+        header.pack(fill="x")
+        self._bg_frames.append(header)
 
         brand = tk.Label(
-            content,
+            header,
             text="TubeSave",
             font=FONTS["brand"],
             fg=COLORS["text"],
             bg=COLORS["bg"],
         )
-        brand.pack(anchor="w")
+        brand.pack(side="left", anchor="w")
+        self._bg_text_labels.append(brand)
+
+        theme_row = tk.Frame(header, bg=COLORS["bg"])
+        theme_row.pack(side="right", anchor="e")
+        self._bg_frames.append(theme_row)
+
+        self.theme_label = tk.Label(
+            theme_row,
+            text="Тёмная тема",
+            font=FONTS["small"],
+            fg=COLORS["muted"],
+            bg=COLORS["bg"],
+        )
+        self.theme_label.pack(side="left", padx=(0, 8))
+        self._bg_muted_labels.append(self.theme_label)
+
+        self.theme_toggle = ThemeToggle(theme_row, self._toggle_theme)
+        self.theme_toggle.set_on(self._theme == "dark")
+        self.theme_toggle.pack(side="left")
 
         subtitle = tk.Label(
             content,
@@ -330,20 +535,25 @@ class YouTubeDownloaderApp(tk.Tk):
             bg=COLORS["bg"],
         )
         subtitle.pack(anchor="w", pady=(2, 14))
+        self._bg_muted_labels.append(subtitle)
 
         # URL card
         url_card = Card(content)
         url_card.pack(fill="x", pady=(0, 10))
+        self._cards.append(url_card)
         url_inner = tk.Frame(url_card, bg=COLORS["surface"])
         url_inner.pack(fill="x", padx=16, pady=12)
+        self._surface_frames.append(url_inner)
 
-        tk.Label(
+        url_title = tk.Label(
             url_inner,
             text="Ссылка",
             font=FONTS["title"],
             fg=COLORS["text"],
             bg=COLORS["surface"],
-        ).pack(anchor="w")
+        )
+        url_title.pack(anchor="w")
+        self._surface_text_labels.append(url_title)
 
         self.url_var = tk.StringVar()
         self.url_entry = tk.Entry(
@@ -359,6 +569,7 @@ class YouTubeDownloaderApp(tk.Tk):
             highlightcolor=COLORS["accent"],
         )
         self.url_entry.pack(fill="x", pady=(6, 0), ipady=7, ipadx=8)
+        self._entries.append(self.url_entry)
         self._bind_clipboard(self.url_entry)
         self.url_entry.bind("<Return>", lambda _e: self._start_download())
         self.url_entry.focus_set()
@@ -366,19 +577,24 @@ class YouTubeDownloaderApp(tk.Tk):
         # Folder card
         folder_card = Card(content)
         folder_card.pack(fill="x", pady=(0, 10))
+        self._cards.append(folder_card)
         folder_inner = tk.Frame(folder_card, bg=COLORS["surface"])
         folder_inner.pack(fill="x", padx=16, pady=12)
+        self._surface_frames.append(folder_inner)
 
-        tk.Label(
+        folder_title = tk.Label(
             folder_inner,
             text="Папка сохранения",
             font=FONTS["title"],
             fg=COLORS["text"],
             bg=COLORS["surface"],
-        ).pack(anchor="w")
+        )
+        folder_title.pack(anchor="w")
+        self._surface_text_labels.append(folder_title)
 
         folder_row = tk.Frame(folder_inner, bg=COLORS["surface"])
         folder_row.pack(fill="x", pady=(6, 0))
+        self._surface_frames.append(folder_row)
 
         self.folder_var = tk.StringVar(value=str(self.download_dir))
         self.folder_entry = tk.Entry(
@@ -394,26 +610,78 @@ class YouTubeDownloaderApp(tk.Tk):
             highlightcolor=COLORS["accent"],
         )
         self.folder_entry.pack(side="left", fill="x", expand=True, ipady=7, ipadx=8)
+        self._entries.append(self.folder_entry)
         self._bind_clipboard(self.folder_entry)
         self.folder_entry.bind("<FocusOut>", lambda _e: self._persist_folder(self.folder_var.get()))
 
-        browse = PillButton(folder_row, "Обзор", self._choose_folder, width=100, height=36)
+        browse = self._register_pill(
+            PillButton(folder_row, "Обзор", self._choose_folder, width=100, height=36),
+            parent_key="surface",
+        )
         browse.pack(side="left", padx=(10, 0))
-        browse.configure(bg=COLORS["surface"])
+
+        open_folder = self._register_pill(
+            PillButton(folder_row, "Открыть", self._open_folder, width=100, height=36),
+            parent_key="surface",
+        )
+        open_folder.pack(side="left", padx=(8, 0))
+
+        # Quality card
+        quality_card = Card(content)
+        quality_card.pack(fill="x", pady=(0, 10))
+        self._cards.append(quality_card)
+        quality_inner = tk.Frame(quality_card, bg=COLORS["surface"])
+        quality_inner.pack(fill="x", padx=16, pady=12)
+        self._surface_frames.append(quality_inner)
+
+        quality_title = tk.Label(
+            quality_inner,
+            text="Качество видео",
+            font=FONTS["title"],
+            fg=COLORS["text"],
+            bg=COLORS["surface"],
+        )
+        quality_title.pack(anchor="w")
+        self._surface_text_labels.append(quality_title)
+
+        quality_hint = tk.Label(
+            quality_inner,
+            text="Если выбранного разрешения нет, будет взято ближайшее доступное.",
+            font=FONTS["small"],
+            fg=COLORS["muted"],
+            bg=COLORS["surface"],
+        )
+        quality_hint.pack(anchor="w", pady=(2, 8))
+        self._surface_muted_labels.append(quality_hint)
+
+        quality_row = tk.Frame(quality_inner, bg=COLORS["surface"])
+        quality_row.pack(fill="x")
+        self._surface_frames.append(quality_row)
+
+        self._quality_chips = []
+        for code, label in QUALITY_OPTIONS:
+            chip = QualityChip(quality_row, code, label, self._select_quality, width=78 if code != "best" else 86)
+            chip.pack(side="left", padx=(0, 8))
+            chip.set_selected(code == self._quality)
+            self._quality_chips.append(chip)
 
         # Info + progress card
         status_card = Card(content)
         status_card.pack(fill="x", pady=(0, 10))
+        self._cards.append(status_card)
         status_inner = tk.Frame(status_card, bg=COLORS["surface"])
         status_inner.pack(fill="x", padx=16, pady=12)
+        self._surface_frames.append(status_inner)
 
-        tk.Label(
+        status_title = tk.Label(
             status_inner,
             text="Статус",
             font=FONTS["title"],
             fg=COLORS["text"],
             bg=COLORS["surface"],
-        ).pack(anchor="w")
+        )
+        status_title.pack(anchor="w")
+        self._surface_text_labels.append(status_title)
 
         self.info_var = tk.StringVar(value="Вставьте ссылку и нажмите «Скачать».")
         self.info_label = tk.Label(
@@ -423,16 +691,18 @@ class YouTubeDownloaderApp(tk.Tk):
             fg=COLORS["muted"],
             bg=COLORS["surface"],
             justify="left",
-            wraplength=680,
+            wraplength=700,
             anchor="w",
         )
         self.info_label.pack(anchor="w", pady=(6, 10))
+        self._surface_muted_labels.append(self.info_label)
 
         self.progress = ProgressBar(status_inner, height=8)
         self.progress.pack(fill="x")
 
         metrics = tk.Frame(status_inner, bg=COLORS["surface"])
         metrics.pack(fill="x", pady=(10, 0))
+        self._surface_frames.append(metrics)
 
         self.stage_var = tk.StringVar(value="Этап: ожидание")
         self.percent_var = tk.StringVar(value="0%")
@@ -461,32 +731,39 @@ class YouTubeDownloaderApp(tk.Tk):
             )
             label.grid(row=col // 3, column=col % 3, sticky="w", padx=(0, 18), pady=2)
             metrics.grid_columnconfigure(col % 3, weight=1)
+            self._surface_muted_labels.append(label)
 
         self.status_var = tk.StringVar(value="Готово к работе")
-        tk.Label(
+        status_label = tk.Label(
             status_inner,
             textvariable=self.status_var,
             font=FONTS["body"],
             fg=COLORS["text"],
             bg=COLORS["surface"],
-            wraplength=680,
+            wraplength=700,
             justify="left",
             anchor="w",
-        ).pack(anchor="w", pady=(10, 0))
+        )
+        status_label.pack(anchor="w", pady=(10, 0))
+        self._surface_text_labels.append(status_label)
 
         # Log card — expands, but never pushes buttons off-screen
         log_card = Card(content)
         log_card.pack(fill="both", expand=True)
+        self._cards.append(log_card)
         log_inner = tk.Frame(log_card, bg=COLORS["surface"])
         log_inner.pack(fill="both", expand=True, padx=16, pady=12)
+        self._surface_frames.append(log_inner)
 
-        tk.Label(
+        log_title = tk.Label(
             log_inner,
             text="Журнал",
             font=FONTS["title"],
             fg=COLORS["text"],
             bg=COLORS["surface"],
-        ).pack(anchor="w")
+        )
+        log_title.pack(anchor="w")
+        self._surface_text_labels.append(log_title)
 
         self.log_text = tk.Text(
             log_inner,
@@ -502,6 +779,75 @@ class YouTubeDownloaderApp(tk.Tk):
             state="disabled",
         )
         self.log_text.pack(fill="both", expand=True, pady=(6, 0))
+
+    def _apply_theme(self) -> None:
+        palette = DARK if self._theme == "dark" else LIGHT
+        COLORS.clear()
+        COLORS.update(palette)
+
+        self.configure(bg=COLORS["bg"])
+        for frame in self._bg_frames:
+            frame.configure(bg=COLORS["bg"])
+        for frame in self._surface_frames:
+            frame.configure(bg=COLORS["surface"])
+        for card in self._cards:
+            card.configure(bg=COLORS["surface"], highlightbackground=COLORS["border"])
+        for label in self._bg_text_labels:
+            label.configure(fg=COLORS["text"], bg=COLORS["bg"])
+        for label in self._bg_muted_labels:
+            label.configure(fg=COLORS["muted"], bg=COLORS["bg"])
+        for label in self._surface_text_labels:
+            label.configure(fg=COLORS["text"], bg=COLORS["surface"])
+        for label in self._surface_muted_labels:
+            if label is self.info_label:
+                current = str(label.cget("fg"))
+                if current in (LIGHT["text"], DARK["text"]):
+                    label.configure(fg=COLORS["text"], bg=COLORS["surface"])
+                else:
+                    label.configure(fg=COLORS["muted"], bg=COLORS["surface"])
+            else:
+                label.configure(fg=COLORS["muted"], bg=COLORS["surface"])
+
+        for entry in self._entries:
+            entry.configure(
+                bg=COLORS["ghost"],
+                fg=COLORS["text"],
+                insertbackground=COLORS["text"],
+                highlightbackground=COLORS["border"],
+                highlightcolor=COLORS["accent"],
+            )
+
+        self.log_text.configure(bg=COLORS["ghost"], fg=COLORS["text"])
+
+        for menu in self._context_menus:
+            menu.configure(bg=COLORS["surface"], fg=COLORS["text"])
+
+        self.theme_toggle.configure(bg=COLORS["bg"])
+        self.theme_toggle.set_on(self._theme == "dark")
+
+        self.progress.configure(bg=COLORS["surface"])
+        self.progress._draw()
+
+        for button, parent_key in self._pill_buttons:
+            button.configure(bg=COLORS[parent_key])
+            button._draw()
+
+        for chip in self._quality_chips:
+            chip.configure(bg=COLORS["surface"])
+            chip.set_selected(chip.code == self._quality)
+
+    def _select_quality(self, code: str) -> None:
+        if code not in QUALITY_CODES:
+            return
+        self._quality = code
+        self._persist_quality()
+        for chip in self._quality_chips:
+            chip.set_selected(chip.code == self._quality)
+
+    def _toggle_theme(self) -> None:
+        self._theme = "light" if self._theme == "dark" else "dark"
+        self._persist_theme()
+        self._apply_theme()
 
     def _bind_clipboard(self, widget: tk.Entry) -> None:
         def paste(_event: tk.Event | None = None) -> str:
@@ -567,6 +913,7 @@ class YouTubeDownloaderApp(tk.Tk):
         menu.add_command(label="Вырезать", command=lambda: cut())
         menu.add_separator()
         menu.add_command(label="Выделить всё", command=lambda: select_all())
+        self._context_menus.append(menu)
         widget.bind("<Button-3>", lambda event: menu.tk_popup(event.x_root, event.y_root))
 
     def _choose_folder(self) -> None:
@@ -575,10 +922,31 @@ class YouTubeDownloaderApp(tk.Tk):
             self.folder_var.set(selected)
             self._persist_folder(selected)
 
+    def _open_folder(self) -> None:
+        folder = Path(self.folder_var.get().strip() or str(self.download_dir))
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            messagebox.showerror("Папка", f"Не удалось создать папку:\n{exc}")
+            return
+        self._persist_folder(folder)
+        path = str(folder.resolve())
+        try:
+            if sys.platform == "win32":
+                os.startfile(path)  # type: ignore[attr-defined]
+            elif sys.platform == "darwin":
+                os.system(f'open "{path}"')
+            else:
+                os.system(f'xdg-open "{path}"')
+        except OSError as exc:
+            messagebox.showerror("Папка", f"Не удалось открыть папку:\n{exc}")
+
     def _set_busy(self, busy: bool) -> None:
         self._is_busy = busy
-        self.info_btn.set_enabled(not busy)
-        self.download_btn.set_enabled(not busy)
+        enabled = not busy
+        self.info_btn.set_enabled(enabled)
+        self.download_btn.set_enabled(enabled)
+        self.audio_btn.set_enabled(enabled)
 
     def _log(self, message: str) -> None:
         stamp = time.strftime("%H:%M:%S")
@@ -729,7 +1097,7 @@ class YouTubeDownloaderApp(tk.Tk):
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _start_download(self) -> None:
+    def _start_download(self, audio_only: bool = False) -> None:
         validated = self._validate_inputs()
         if validated is None or self._is_busy:
             return
@@ -740,8 +1108,19 @@ class YouTubeDownloaderApp(tk.Tk):
         self._start_timer()
         self._events.put(("progress_mode", "indeterminate"))
         self._events.put(("stage", "Подготовка"))
-        self._events.put(("status", "Подготовка к скачиванию…"))
-        self._events.put(("log", f"Ссылка: {url}"))
+        if audio_only:
+            self._events.put(("status", "Скачивание аудио…"))
+            self._events.put(("log", f"Аудио: {url}"))
+        else:
+            quality_label = next(
+                (label for code, label in QUALITY_OPTIONS if code == self._quality),
+                self._quality,
+            )
+            self._events.put(("status", "Подготовка к скачиванию…"))
+            self._events.put(("log", f"Ссылка: {url}"))
+            self._events.put(("log", f"Качество: {quality_label}"))
+
+        selected_quality = self._quality
 
         def status_callback(message: str) -> None:
             stage_map = {
@@ -799,11 +1178,16 @@ class YouTubeDownloaderApp(tk.Tk):
                         folder,
                         progress_hook=progress_hook,
                         status_callback=status_callback,
+                        audio_only=audio_only,
+                        quality=selected_quality,
                     )
                 size = format_bytes(filepath.stat().st_size) if filepath.exists() else "—"
                 self._events.put(("size", size))
                 self._events.put(("log", f"Сохранено: {filepath}"))
-                self._events.put(("done", (True, f"Видео сохранено:\n{filepath}")))
+                if audio_only:
+                    self._events.put(("done", (True, f"Аудио сохранено:\n{filepath}")))
+                else:
+                    self._events.put(("done", (True, f"Видео сохранено:\n{filepath}")))
             except Exception as exc:
                 log_output = sink.getvalue().strip()
                 if log_output:

@@ -81,7 +81,7 @@ def embed_thumbnail(video_path: Path, thumb_path: Path | None = None) -> Path:
         return video_path
 
     ffmpeg = get_ffmpeg_location()
-    temp_out = video_path.with_name(video_path.stem + ".thumb.tmp.mp4")
+    temp_out = video_path.with_name(video_path.stem + ".thumb.tmp" + video_path.suffix)
     cmd = [
         ffmpeg,
         "-y",
@@ -118,18 +118,53 @@ def embed_thumbnail(video_path: Path, thumb_path: Path | None = None) -> Path:
     return video_path
 
 
+def format_selector(*, audio_only: bool = False, quality: str = "best") -> str:
+    """Build yt-dlp format string for video quality or audio-only."""
+    if audio_only:
+        return "ba[ext=m4a]/ba[acodec^=mp4a]/ba/b"
+
+    quality = (quality or "best").strip().lower()
+    if quality in {"best", "max", "highest"}:
+        return "bv*[vcodec^=avc1]+ba[ext=m4a]/bv*+ba[ext=m4a]/bv*+ba/b"
+
+    try:
+        height = int(quality.rstrip("p"))
+    except ValueError:
+        return "bv*[vcodec^=avc1]+ba[ext=m4a]/bv*+ba[ext=m4a]/bv*+ba/b"
+
+    return (
+        f"bv*[height<=?{height}][vcodec^=avc1]+ba[ext=m4a]/"
+        f"bv*[height<=?{height}]+ba[ext=m4a]/"
+        f"bv*[height<=?{height}]+ba/"
+        f"bv*[vcodec^=avc1]+ba[ext=m4a]/bv*+ba[ext=m4a]/bv*+ba/b"
+    )
+
+
+def fallback_format_selector(*, audio_only: bool = False, quality: str = "best") -> str:
+    if audio_only:
+        return "ba/b"
+    quality = (quality or "best").strip().lower()
+    if quality in {"best", "max", "highest"}:
+        return "best[ext=mp4]/best"
+    try:
+        height = int(quality.rstrip("p"))
+    except ValueError:
+        return "best[ext=mp4]/best"
+    return f"best[height<=?{height}][ext=mp4]/best[ext=mp4]/best"
+
+
 def build_ydl_opts(
     output_dir: Path,
     progress_hook: ProgressCallback | None = None,
     status_callback: StatusCallback | None = None,
+    *,
+    audio_only: bool = False,
+    quality: str = "best",
 ) -> dict:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     opts: dict = {
         "outtmpl": str(output_dir / "%(title)s [%(id)s].%(ext)s"),
-        # Prefer H.264 + AAC for quality, Windows thumbnails and player compatibility.
-        "format": "bv*[vcodec^=avc1]+ba[ext=m4a]/bv*+ba[ext=m4a]/bv*+ba/b",
-        "merge_output_format": "mp4",
         "ffmpeg_location": get_ffmpeg_location(),
         "writethumbnail": True,
         "writeinfojson": False,
@@ -143,6 +178,7 @@ def build_ydl_opts(
         "no_warnings": True,
         "noprogress": True,
         "restrictfilenames": False,
+        "format": format_selector(audio_only=audio_only, quality=quality),
         "postprocessors": [
             {
                 "key": "FFmpegThumbnailsConvertor",
@@ -151,6 +187,17 @@ def build_ydl_opts(
             },
         ],
     }
+
+    if audio_only:
+        opts["postprocessors"].append(
+            {
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "m4a",
+                "preferredquality": "0",
+            }
+        )
+    else:
+        opts["merge_output_format"] = "mp4"
 
     impersonate = get_impersonate_target()
     if impersonate is not None:
@@ -167,6 +214,8 @@ def build_ydl_opts(
             if status == "started":
                 if postprocessor == "Merger":
                     status_callback("Объединение видео и аудио…")
+                elif postprocessor == "FFmpegExtractAudio":
+                    status_callback("Извлечение аудио…")
                 elif postprocessor == "FFmpegThumbnailsConvertor":
                     status_callback("Подготовка превью…")
                 elif postprocessor == "FFmpegVideoConvertor":
@@ -197,8 +246,30 @@ def fetch_video_info(url: str) -> dict:
         return ydl.extract_info(url.strip(), download=False)
 
 
-def _resolve_output_path(ydl: yt_dlp.YoutubeDL, info: dict) -> Path:
+def _resolve_output_path(
+    ydl: yt_dlp.YoutubeDL,
+    info: dict,
+    *,
+    audio_only: bool = False,
+) -> Path:
     filepath = Path(ydl.prepare_filename(info))
+    if audio_only:
+        for ext in (".m4a", ".mp3", ".aac", ".opus", ".ogg", ".wav"):
+            candidate = filepath.with_suffix(ext)
+            if candidate.exists():
+                return candidate
+        # After extract, original media may be deleted; search by id/title stem.
+        stem = filepath.with_suffix("").name
+        matches = sorted(filepath.parent.glob(stem + ".*"))
+        audio_matches = [
+            path
+            for path in matches
+            if path.suffix.lower() in {".m4a", ".mp3", ".aac", ".opus", ".ogg", ".wav"}
+        ]
+        if audio_matches:
+            return audio_matches[0]
+        return filepath
+
     if filepath.suffix.lower() != ".mp4":
         mp4_path = filepath.with_suffix(".mp4")
         if mp4_path.exists():
@@ -210,6 +281,8 @@ def _try_download(
     url: str,
     opts: dict,
     report: Callable[[str], None] | None = None,
+    *,
+    audio_only: bool = False,
 ) -> Path:
     if report is not None:
         report("Получение информации о видео…")
@@ -217,7 +290,7 @@ def _try_download(
         info = ydl.extract_info(url, download=True)
         if info is None:
             raise RuntimeError("Не удалось получить информацию о видео.")
-        return _resolve_output_path(ydl, info)
+        return _resolve_output_path(ydl, info, audio_only=audio_only)
 
 
 def download_video(
@@ -225,6 +298,9 @@ def download_video(
     output_dir: Path,
     progress_hook: ProgressCallback | None = None,
     status_callback: StatusCallback | None = None,
+    *,
+    audio_only: bool = False,
+    quality: str = "best",
 ) -> Path:
     url = url.strip()
     if not is_youtube_url(url):
@@ -235,7 +311,13 @@ def download_video(
             status_callback(message)
 
     report("Подключение к YouTube…")
-    opts = build_ydl_opts(output_dir, progress_hook, status_callback)
+    opts = build_ydl_opts(
+        output_dir,
+        progress_hook,
+        status_callback,
+        audio_only=audio_only,
+        quality=quality,
+    )
 
     last_error: Exception | None = None
     filepath: Path | None = None
@@ -244,7 +326,7 @@ def download_video(
             if attempt > 1:
                 report(f"Повтор скачивания ({attempt}/3)…")
                 time.sleep(1.5 * attempt)
-            filepath = _try_download(url, opts, report)
+            filepath = _try_download(url, opts, report, audio_only=audio_only)
             break
         except yt_dlp.utils.DownloadError as exc:
             last_error = exc
@@ -255,18 +337,23 @@ def download_video(
     if filepath is None:
         report("Обход блокировки YouTube…")
         fallback = dict(opts)
-        fallback["format"] = "best[ext=mp4]/best"
+        fallback["format"] = fallback_format_selector(audio_only=audio_only, quality=quality)
         fallback["extractor_args"] = {
             "youtube": {"player_client": ["android", "android_sdkless"]},
         }
         try:
-            filepath = _try_download(url, fallback, report)
+            filepath = _try_download(url, fallback, report, audio_only=audio_only)
         except Exception:
             assert last_error is not None
             raise last_error from None
 
     report("Проверка результата…")
-    if filepath.suffix.lower() != ".mp4":
+    if audio_only:
+        if filepath.suffix.lower() not in {".m4a", ".mp3", ".aac"}:
+            m4a_path = filepath.with_suffix(".m4a")
+            if m4a_path.exists():
+                filepath = m4a_path
+    elif filepath.suffix.lower() != ".mp4":
         mp4_path = filepath.with_suffix(".mp4")
         if mp4_path.exists():
             filepath = mp4_path
