@@ -17,6 +17,71 @@ from tkinter import filedialog, messagebox
 from downloader import download_video, fetch_video_info, is_youtube_url
 
 
+def notify_windows(title: str, message: str) -> None:
+    """Show a Windows toast notification (no blocking dialog)."""
+    body = " ".join(str(message).split())
+    if len(body) > 220:
+        body = body[:217] + "…"
+
+    try:
+        from winotify import Notification
+
+        toast = Notification(
+            app_id="TubeSave",
+            title=title,
+            msg=body,
+            duration="short",
+        )
+        toast.show()
+        return
+    except Exception:
+        pass
+
+    # Fallback via PowerShell WinRT toast
+    import subprocess
+
+    def xml_escape(value: str) -> str:
+        return (
+            value.replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+            .replace('"', "&quot;")
+        )
+
+    title_xml = xml_escape(title)[:80]
+    body_xml = xml_escape(body)[:220]
+    script = f"""
+[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null
+[Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] | Out-Null
+$template = @"
+<toast>
+  <visual>
+    <binding template="ToastGeneric">
+      <text>{title_xml}</text>
+      <text>{body_xml}</text>
+    </binding>
+  </visual>
+</toast>
+"@
+$xml = New-Object Windows.Data.Xml.Dom.XmlDocument
+$xml.LoadXml($template)
+$toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
+[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier("TubeSave").Show($toast)
+"""
+    flags = 0
+    if hasattr(subprocess, "CREATE_NO_WINDOW"):
+        flags = subprocess.CREATE_NO_WINDOW
+    try:
+        subprocess.Popen(
+            ["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", script],
+            creationflags=flags,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError:
+        pass
+
+
 def settings_path() -> Path:
     return Path.home() / "AppData" / "Roaming" / "TubeSave" / "settings.json"
 
@@ -1026,7 +1091,7 @@ class YouTubeDownloaderApp(tk.Tk):
                     self._set_stage("Готово")
                     self.status_var.set(message.split("\n")[0])
                     self._log(message.replace("\n", " "))
-                    messagebox.showinfo("Готово", message)
+                    notify_windows("TubeSave — готово", message)
                 else:
                     self.progress.set_value(0)
                     self.percent_var.set("0%")
