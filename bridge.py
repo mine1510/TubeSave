@@ -2,19 +2,28 @@
 
 from __future__ import annotations
 
+import ctypes
 import json
+import os
+import struct
+import subprocess
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Callable
 from urllib.error import URLError
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
 from urllib.request import Request, urlopen
 
 BRIDGE_HOST = "127.0.0.1"
 BRIDGE_PORT = 17834
 BRIDGE_BASE = f"http://{BRIDGE_HOST}:{BRIDGE_PORT}"
+NATIVE_HOST_NAME = "com.tubesave.host"
+PINNED_EXTENSION_ID = "hmddmgmenbnhoeghphinmmnoeklgbhgg"
+INSTANCE_MUTEX_NAME = "Local\\TubeSave.mine1510.single"
+_INSTANCE_MUTEX_HANDLE = None
 
 UrlHandler = Callable[[str, bool, bool, str], None]
 
@@ -86,6 +95,198 @@ def register_protocol() -> bool:
         return True
     except OSError:
         return False
+
+
+def _native_host_bat_path() -> Path:
+    return app_root() / "tubesave-native-host.bat"
+
+
+def _native_host_manifest_path() -> Path:
+    return app_root() / f"{NATIVE_HOST_NAME}.json"
+
+
+def _write_native_host_launcher() -> Path:
+    root = app_root()
+    bat = _native_host_bat_path()
+    if getattr(sys, "frozen", False):
+        exe = Path(sys.executable).resolve()
+        body = (
+            "@echo off\r\n"
+            f'"{exe}" --native-messaging\r\n'
+        )
+    else:
+        python = Path(sys.executable).resolve()
+        script = (Path(__file__).resolve().parent / "app.py").resolve()
+        body = (
+            "@echo off\r\n"
+            f'"{python}" "{script}" --native-messaging\r\n'
+        )
+    bat.write_text(body, encoding="utf-8")
+    return bat
+
+
+def _extra_ids_path() -> Path:
+    return app_root() / "native-extension-ids.json"
+
+
+def _load_extra_extension_ids() -> list[str]:
+    path = _extra_ids_path()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    if not isinstance(data, list):
+        return []
+    return [str(item).strip() for item in data if str(item).strip()]
+
+
+def _save_extra_extension_ids(ids: list[str]) -> None:
+    unique: list[str] = []
+    for item in ids:
+        if item and item not in unique:
+            unique.append(item)
+    _extra_ids_path().write_text(
+        json.dumps(unique, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def register_native_host(extra_extension_ids: list[str] | None = None) -> bool:
+    """Register a Chrome/Edge/Yandex native host that can start TubeSave."""
+    if sys.platform != "win32":
+        return False
+    try:
+        import winreg
+    except ImportError:
+        return False
+
+    try:
+        saved = _load_extra_extension_ids()
+        for ext_id in extra_extension_ids or []:
+            ext_id = str(ext_id).strip()
+            if ext_id and ext_id not in saved:
+                saved.append(ext_id)
+        if extra_extension_ids:
+            _save_extra_extension_ids(saved)
+
+        bat = _write_native_host_launcher()
+        origins = [f"chrome-extension://{PINNED_EXTENSION_ID}/"]
+        for ext_id in saved:
+            origin = f"chrome-extension://{ext_id}/"
+            if origin not in origins:
+                origins.append(origin)
+        manifest = {
+            "name": NATIVE_HOST_NAME,
+            "description": "TubeSave launcher",
+            "path": str(bat.resolve()),
+            "type": "stdio",
+            "allowed_origins": origins,
+        }
+        manifest_path = _native_host_manifest_path()
+        manifest_path.write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        keys = [
+            rf"Software\Google\Chrome\NativeMessagingHosts\{NATIVE_HOST_NAME}",
+            rf"Software\Chromium\NativeMessagingHosts\{NATIVE_HOST_NAME}",
+            rf"Software\Microsoft\Edge\NativeMessagingHosts\{NATIVE_HOST_NAME}",
+            rf"Software\Yandex\YandexBrowser\NativeMessagingHosts\{NATIVE_HOST_NAME}",
+            rf"Software\BraveSoftware\Brave-Browser\NativeMessagingHosts\{NATIVE_HOST_NAME}",
+        ]
+        for key_path in keys:
+            handle = winreg.CreateKey(winreg.HKEY_CURRENT_USER, key_path)
+            winreg.SetValueEx(handle, "", 0, winreg.REG_SZ, str(manifest_path.resolve()))
+            winreg.CloseKey(handle)
+        return True
+    except OSError:
+        return False
+
+
+def acquire_instance_lock() -> bool:
+    """True if this process should run the UI (primary instance)."""
+    global _INSTANCE_MUTEX_HANDLE
+    if sys.platform != "win32":
+        return not is_bridge_alive()
+    kernel32 = ctypes.windll.kernel32
+    _INSTANCE_MUTEX_HANDLE = kernel32.CreateMutexW(None, False, INSTANCE_MUTEX_NAME)
+    already = kernel32.GetLastError() == 183
+    return not already
+
+
+def launch_app_detached(
+    url: str = "",
+    auto_start: bool = True,
+    audio_only: bool = False,
+    quality: str = "best",
+) -> None:
+    """Start TubeSave in a new process (used by the native messaging host)."""
+    args: list[str]
+    if url:
+        protocol = (
+            "tubesave://download?"
+            f"url={quote(url, safe='')}&auto={1 if auto_start else 0}"
+            f"&audio={1 if audio_only else 0}&quality={quote(quality or 'best', safe='')}"
+        )
+        extra = [protocol]
+    else:
+        extra = []
+    if getattr(sys, "frozen", False):
+        args = [str(Path(sys.executable).resolve()), *extra]
+        cwd = str(Path(sys.executable).resolve().parent)
+    else:
+        script = (Path(__file__).resolve().parent / "app.py").resolve()
+        args = [str(Path(sys.executable).resolve()), str(script), *extra]
+        cwd = str(script.parent)
+    flags = 0
+    if sys.platform == "win32":
+        flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+    subprocess.Popen(
+        args,
+        cwd=cwd,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        close_fds=True,
+        creationflags=flags,
+    )
+
+
+def run_native_host() -> None:
+    """Chrome native messaging: launch TubeSave, reply, exit."""
+    if sys.platform == "win32":
+        import msvcrt
+
+        msvcrt.setmode(sys.stdin.fileno(), os.O_BINARY)
+        msvcrt.setmode(sys.stdout.fileno(), os.O_BINARY)
+
+    data: dict = {}
+    try:
+        raw_len = sys.stdin.buffer.read(4)
+        if len(raw_len) == 4:
+            n = struct.unpack("<I", raw_len)[0]
+            body = sys.stdin.buffer.read(n) if n else b"{}"
+            parsed = json.loads(body.decode("utf-8") or "{}")
+            if isinstance(parsed, dict):
+                data = parsed
+    except (OSError, json.JSONDecodeError, ValueError):
+        data = {}
+
+    url = str(data.get("url") or "").strip()
+    auto = _as_bool(data.get("auto", data.get("auto_start", True)), True)
+    audio = _as_bool(data.get("audio", data.get("audio_only")), "music.yandex." in url.lower())
+    quality = _normalize_quality(data.get("quality") or "best")
+    if is_bridge_alive():
+        ok = try_handoff(url, auto, audio, quality) if url else try_focus()
+        payload = {"ok": True, "alive": True, "handed": bool(ok)}
+    else:
+        launch_app_detached(url, auto, audio, quality)
+        payload = {"ok": True, "launched": True}
+
+    raw = json.dumps(payload).encode("utf-8")
+    sys.stdout.buffer.write(struct.pack("<I", len(raw)))
+    sys.stdout.buffer.write(raw)
+    sys.stdout.buffer.flush()
 
 
 def parse_incoming_arg(raw: str) -> tuple[str | None, bool, bool, str]:
@@ -297,6 +498,9 @@ class _BridgeHandler(BaseHTTPRequestHandler):
             cb = _BRIDGE_CALLBACKS.get("on_url")
             if cb is not None:
                 cb(url, auto, audio, quality)
+            ext_id = str(data.get("extension_id") or "").strip()
+            if ext_id:
+                register_native_host([ext_id])
             self._json(200, {"ok": True, "queued": True})
             return
 

@@ -80,7 +80,35 @@
     host.appendChild(btn);
   }
 
+  function isOnScreen(el) {
+    if (!el) {
+      return false;
+    }
+    const r = el.getBoundingClientRect();
+    return r.width > 8 && r.height > 8 && r.bottom > 0 && r.top < window.innerHeight;
+  }
+
+  function firstVisible(nodes) {
+    for (const el of nodes) {
+      if (isOnScreen(el)) {
+        return el;
+      }
+    }
+    return null;
+  }
+
   function findActiveShortsActions() {
+    // New YouTube Shorts UI (2025/2026): vertical rail is reel-action-bar-view-model.
+    const bar = firstVisible(document.querySelectorAll("reel-action-bar-view-model"));
+    if (bar) {
+      return bar;
+    }
+    const container = firstVisible(
+      document.querySelectorAll(".ytReelPlayerOverlayViewModelActionsContainer")
+    );
+    if (container) {
+      return container;
+    }
     const active =
       document.querySelector("ytd-reel-video-renderer[is-active]") ||
       document.querySelector("ytd-reel-video-renderer[is-active='']");
@@ -89,14 +117,21 @@
         active.querySelector("#actions.ytd-reel-player-overlay-renderer") ||
         active.querySelector("ytd-reel-player-overlay-renderer #actions") ||
         active.querySelector("#actions");
-      if (actions) {
+      if (isOnScreen(actions)) {
         return actions;
       }
     }
+    const legacy = firstVisible(
+      document.querySelectorAll("ytd-reel-player-overlay-renderer #actions")
+    );
+    return legacy;
+  }
+
+  function findShortsPlayer() {
     return (
-      document.querySelector("ytd-reel-player-overlay-renderer #actions") ||
-      document.querySelector("#shorts-inner-container ytd-reel-player-overlay-renderer #actions") ||
-      null
+      document.querySelector("ytd-reel-video-renderer[is-active] ytd-player") ||
+      document.querySelector("ytd-shorts ytd-player") ||
+      document.querySelector("ytd-player")
     );
   }
 
@@ -120,7 +155,7 @@
     wrap.style.setProperty("align-items", "center", "important");
     wrap.style.setProperty("justify-content", "center", "important");
     wrap.style.setProperty("width", "48px", "important");
-    wrap.style.setProperty("margin", "12px 0 0 0", "important");
+    wrap.style.setProperty("margin", "0 0 4px 0", "important");
     wrap.style.setProperty("pointer-events", "auto", "important");
     wrap.style.setProperty("z-index", "30", "important");
     wrap.style.setProperty("position", "relative", "important");
@@ -128,9 +163,19 @@
 
     const btn = document.createElement("button");
     btn.type = "button";
-    btn.innerHTML =
-      '<svg viewBox="0 0 24 24" width="24" height="24" aria-hidden="true">' +
-      '<path fill="#fff" d="M12 3v10.2l3.4-3.4 1.4 1.4L12 16.4 7.2 11.6l1.4-1.4L11 13.2V3h1zm-7 16h14v2H5v-2z"/></svg>';
+    const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    svg.setAttribute("viewBox", "0 0 24 24");
+    svg.setAttribute("width", "24");
+    svg.setAttribute("height", "24");
+    svg.setAttribute("aria-hidden", "true");
+    const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+    path.setAttribute("fill", "#fff");
+    path.setAttribute(
+      "d",
+      "M12 3v10.2l3.4-3.4 1.4 1.4L12 16.4 7.2 11.6l1.4-1.4L11 13.2V3h1zm-7 16h14v2H5v-2z"
+    );
+    svg.appendChild(path);
+    btn.appendChild(svg);
     applyBase(btn);
     btn.style.setProperty("width", "48px", "important");
     btn.style.setProperty("height", "48px", "important");
@@ -158,31 +203,69 @@
     return wrap;
   }
 
+  function resetShortsLayout(wrap) {
+    wrap.style.setProperty("position", "relative", "important");
+    wrap.style.removeProperty("left");
+    wrap.style.removeProperty("top");
+    wrap.style.setProperty("margin", "0 0 4px 0", "important");
+  }
+
+  function pinShortsOverlay(wrap) {
+    if (wrap.parentElement !== document.documentElement) {
+      document.documentElement.appendChild(wrap);
+    }
+    wrap.style.setProperty("position", "fixed", "important");
+    wrap.style.setProperty("z-index", "2147483646", "important");
+    wrap.style.setProperty("margin", "0", "important");
+
+    const bar = firstVisible(document.querySelectorAll("reel-action-bar-view-model"));
+    const player = findShortsPlayer();
+    const h = wrap.offsetHeight || 78;
+    if (bar) {
+      const r = bar.getBoundingClientRect();
+      wrap.style.setProperty("left", `${Math.round(r.left)}px`, "important");
+      wrap.style.setProperty("top", `${Math.max(8, Math.round(r.top - h - 4))}px`, "important");
+      return;
+    }
+    if (player && isOnScreen(player)) {
+      const r = player.getBoundingClientRect();
+      wrap.style.setProperty("left", `${Math.round(r.right + 12)}px`, "important");
+      wrap.style.setProperty("top", `${Math.round(r.top + r.height * 0.42)}px`, "important");
+    }
+  }
+
   function placeShortsButton(host, wrap) {
+    resetShortsLayout(wrap);
     const like = findLikeInActions(host);
-    if (like && wrap.nextElementSibling !== like) {
-      host.insertBefore(wrap, like);
+    if (like) {
+      if (wrap.nextElementSibling !== like || wrap.parentElement !== host) {
+        host.insertBefore(wrap, like);
+      }
       return;
     }
     if (wrap.parentElement !== host) {
-      if (like) {
-        host.insertBefore(wrap, like);
-      } else {
-        host.insertBefore(wrap, host.firstChild);
-      }
+      host.insertBefore(wrap, host.firstChild);
     }
   }
 
   function ensureShortsButton() {
-    const host = findActiveShortsActions();
-    if (!host) {
-      return;
-    }
     let wrap = document.getElementById(SHORTS_BTN_ID);
     if (!wrap) {
       wrap = createShortsAction();
     }
-    placeShortsButton(host, wrap);
+    // YouTube's new Shorts rail (reel-action-bar-view-model) drops unknown children.
+    // Always pin above the like column using the rail/player rect, not inside YT DOM.
+    const host = findActiveShortsActions();
+    if (host && host.tagName && /^(YTD-|YT-)/i.test(host.tagName) === false && host.id === "actions") {
+      placeShortsButton(host, wrap);
+      requestAnimationFrame(() => {
+        if (!isOnScreen(wrap)) {
+          pinShortsOverlay(wrap);
+        }
+      });
+      return;
+    }
+    pinShortsOverlay(wrap);
   }
 
   function clearShortsButton() {
@@ -194,13 +277,17 @@
   }
 
   function ensureButton() {
-    if (isShortsPage()) {
-      clearWatchButton();
-      ensureShortsButton();
-      return;
+    try {
+      if (isShortsPage()) {
+        clearWatchButton();
+        ensureShortsButton();
+        return;
+      }
+      clearShortsButton();
+      ensureWatchButton();
+    } catch (err) {
+      console.warn("TubeSave button:", err);
     }
-    clearShortsButton();
-    ensureWatchButton();
   }
 
   ensureButton();

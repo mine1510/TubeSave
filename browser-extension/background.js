@@ -50,6 +50,7 @@ async function sendToApp(url, autoStart = true, audioOnly = false, quality = "be
       auto_start: autoStart,
       audio_only: audioOnly || isYandexMusic(url),
       quality: quality || "best",
+      extension_id: chrome.runtime.id,
     }),
   });
   if (!res.ok) {
@@ -65,23 +66,71 @@ async function sendToApp(url, autoStart = true, audioOnly = false, quality = "be
 function openViaProtocol(url, autoStart = true, audioOnly = false, quality = "best") {
   const auto = autoStart ? "1" : "0";
   const audio = audioOnly || isYandexMusic(url) ? "1" : "0";
-  const q = encodeURIComponent(quality || "best");
-  const target =
-    `tubesave://download?url=${encodeURIComponent(url)}&auto=${auto}&audio=${audio}&quality=${q}`;
-  chrome.tabs.create({ url: target, active: false }, (tab) => {
-    if (chrome.runtime.lastError) {
-      console.warn(chrome.runtime.lastError.message);
+  const q = quality || "best";
+  const page =
+    chrome.runtime.getURL("launch.html") +
+    "?" +
+    new URLSearchParams({ url, auto, audio, quality: q }).toString();
+  chrome.windows.create(
+    { url: page, type: "popup", width: 440, height: 180, focused: true },
+    (win) => {
+      if (chrome.runtime.lastError) {
+        chrome.tabs.create({ url: page, active: true });
+      }
+      const windowId = win && win.id;
+      setTimeout(() => {
+        if (windowId != null) {
+          chrome.windows.remove(windowId).catch(() => {});
+        }
+      }, 8000);
+    }
+  );
+}
+
+function sendNative(url, autoStart, audioOnly, quality) {
+  return new Promise((resolve, reject) => {
+    if (!chrome.runtime.sendNativeMessage) {
+      reject(new Error("nativeMessaging unavailable"));
       return;
     }
-    if (tab && tab.id != null) {
-      setTimeout(() => {
-        chrome.tabs.remove(tab.id).catch(() => {});
-      }, 1200);
-    }
+    chrome.runtime.sendNativeMessage(
+      "com.tubesave.host",
+      {
+        url,
+        auto: autoStart ? 1 : 0,
+        audio: audioOnly ? 1 : 0,
+        quality: quality || "best",
+      },
+      (response) => {
+        if (chrome.runtime.lastError) {
+          reject(new Error(chrome.runtime.lastError.message));
+          return;
+        }
+        resolve(response || {});
+      }
+    );
   });
 }
 
-async function downloadUrl(url, { notify = true, audioOnly = false, quality = "best" } = {}) {
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function waitForBridge(timeoutMs = 25000) {
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    if (await pingBridge()) {
+      return true;
+    }
+    await sleep(400);
+  }
+  return false;
+}
+
+async function downloadUrl(
+  url,
+  { notify = true, audioOnly = false, quality = "best", protocolFired = false } = {}
+) {
   if (!url || !/^https?:\/\//i.test(url)) {
     throw new Error("Нет ссылки");
   }
@@ -91,8 +140,7 @@ async function downloadUrl(url, { notify = true, audioOnly = false, quality = "b
 
   const audio = Boolean(audioOnly) || isYandexMusic(url);
   const q = quality || "best";
-  const alive = await pingBridge();
-  if (alive) {
+  if (await pingBridge()) {
     await sendToApp(url, true, audio, q);
     if (notify) {
       await setBadge("OK", "#2F6FED");
@@ -100,11 +148,40 @@ async function downloadUrl(url, { notify = true, audioOnly = false, quality = "b
     return { mode: "bridge", audio_only: audio, quality: q };
   }
 
-  openViaProtocol(url, true, audio, q);
-  if (notify) {
-    await setBadge("…", "#C45C26");
+  async function launchApp() {
+    let mode = "protocol";
+    let launched = false;
+    try {
+      const native = await sendNative(url, true, audio, q);
+      if (native && native.ok) {
+        mode = "native";
+        launched = true;
+      }
+    } catch {
+      // Host is registered only after TubeSave has been opened at least once.
+    }
+    if (!launched) {
+      openViaProtocol(url, true, audio, q);
+    }
+    return mode;
   }
-  return { mode: "protocol", audio_only: audio, quality: q };
+
+  let mode = protocolFired ? "protocol" : await launchApp();
+  let ready = await waitForBridge(protocolFired ? 8000 : 25000);
+  if (!ready && protocolFired) {
+    mode = await launchApp();
+    ready = await waitForBridge(20000);
+  }
+  if (!ready) {
+    throw new Error(
+      "Не удалось запустить TubeSave. Откройте приложение один раз, затем нажмите «Скачать» снова."
+    );
+  }
+  await sendToApp(url, true, audio, q);
+  if (notify) {
+    await setBadge("OK", "#2F6FED");
+  }
+  return { mode, audio_only: audio, quality: q };
 }
 
 async function setBadge(text, color) {
@@ -141,6 +218,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   downloadUrl(message.url || "", {
     audioOnly: Boolean(message.audio_only),
     quality: message.quality || "best",
+    protocolFired: Boolean(message.protocol_fired),
   })
     .then((result) => sendResponse({ ok: true, ...result }))
     .catch((err) =>

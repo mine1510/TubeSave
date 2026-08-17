@@ -92,11 +92,17 @@
     ev.stopPropagation();
     const btn = ev.currentTarget;
     btn.disabled = true;
+    const url = trackUrlFromPage();
+    if (window.TubeSaveLaunchProtocol) {
+      window.TubeSaveLaunchProtocol(url, true, "best");
+    }
+    flash(btn, "Запуск…", "#C45C26");
     try {
       const response = await chrome.runtime.sendMessage({
         type: "tubesave-download",
-        url: trackUrlFromPage(),
+        url,
         audio_only: true,
+        protocol_fired: true,
       });
       if (response && response.ok) {
         flash(btn, "Отправлено", "#1B7F4B");

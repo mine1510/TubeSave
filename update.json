@@ -1,7 +1,7 @@
 {
-  "app": "1.3.0",
-  "extension": "1.3.0",
-  "notes": "Трей, multi-site, Shorts/клипы/Я.Музыка, автообновление приложения и плагина.",
+  "app": "1.3.2",
+  "extension": "1.3.2",
+  "notes": "Кнопка «Скачать» в браузере сама запускает TubeSave, если приложение закрыто.",
   "release_page": "https://github.com/mine1510/TubeSave/releases/latest",
   "app_zip": "https://github.com/mine1510/TubeSave/releases/latest/download/TubeSave-Windows.zip",
   "extension_zip": "https://github.com/mine1510/TubeSave/releases/latest/download/TubeSave-Extension.zip"

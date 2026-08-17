@@ -19,13 +19,15 @@
   }
 
   function flash(btn, text, bg) {
-    const prev = btn.dataset.tsLabel || btn.textContent;
+    const caption = btn.querySelector("span") || btn;
+    const prev = btn.dataset.tsLabel || caption.textContent;
     const prevBg = btn.dataset.tsBg || btn.style.background;
-    btn.textContent = text;
-    btn.style.background = bg;
+    caption.textContent = text;
+    const paintTarget = btn.querySelector("button") || btn;
+    paintTarget.style.background = bg;
     setTimeout(() => {
-      btn.textContent = prev;
-      btn.style.background = prevBg;
+      caption.textContent = prev;
+      paintTarget.style.background = prevBg;
     }, 1400);
   }
 
@@ -35,6 +37,7 @@
       url,
       audio_only: Boolean(audioOnly),
       quality: quality || "best",
+      protocol_fired: true,
     });
   }
 
@@ -145,9 +148,14 @@
         ev.preventDefault();
         ev.stopPropagation();
         const url = getUrl();
+        const audioOnly = format === "aac";
         closeMenu();
+        if (window.TubeSaveLaunchProtocol) {
+          window.TubeSaveLaunchProtocol(url, audioOnly, q.code);
+        }
+        flash(anchor, "Запуск…", "#C45C26");
         try {
-          const response = await sendDownload(url, format === "aac", q.code);
+          const response = await sendDownload(url, audioOnly, q.code);
           if (response && response.ok) {
             flash(anchor, "Отправлено", "#1B7F4B");
           } else {
@@ -194,9 +202,11 @@
     if (anchor.dataset.tsPicker === "1") {
       return;
     }
+    const caption = anchor.querySelector("span");
     anchor.dataset.tsPicker = "1";
-    anchor.dataset.tsLabel = anchor.textContent;
-    anchor.dataset.tsBg = anchor.style.background || "#2F6FED";
+    anchor.dataset.tsLabel = caption ? caption.textContent : anchor.textContent;
+    const paintTarget = anchor.querySelector("button") || anchor;
+    anchor.dataset.tsBg = paintTarget.style.background || "#2F6FED";
     anchor.title = "Скачать видео: выбрать качество и формат";
     anchor.addEventListener("click", (ev) => {
       ev.preventDefault();

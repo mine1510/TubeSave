@@ -23,10 +23,13 @@ from downloader import (
 )
 from bridge import (
     BRIDGE_PORT,
+    acquire_instance_lock,
     collect_launch_urls,
     extension_dir,
     is_bridge_alive,
+    register_native_host,
     register_protocol,
+    run_native_host,
     start_bridge,
     try_handoff,
     try_focus,
@@ -472,7 +475,7 @@ class Card(tk.Frame):
 class YouTubeDownloaderApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
-        self.title("TubeSave")
+        self.title(f"TubeSave {APP_VERSION}")
         self.resizable(True, True)
 
         default_dir = Path.home() / "Downloads" / "TubeSave"
@@ -489,6 +492,7 @@ class YouTubeDownloaderApp(tk.Tk):
         self.configure(bg=COLORS["bg"])
         self._events: queue.Queue[tuple[str, object]] = queue.Queue()
         self._is_busy = False
+        self._last_external: tuple[str, float] | None = None
         self._started_at: float | None = None
         self._timer_job: str | None = None
         self._current_stage = "Ожидание"
@@ -517,6 +521,7 @@ class YouTubeDownloaderApp(tk.Tk):
             on_update_app=self._bridge_update_app,
         )
         register_protocol()
+        register_native_host()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._tray = None
         self._tray_thread = None
@@ -1269,11 +1274,21 @@ class YouTubeDownloaderApp(tk.Tk):
         if not url:
             return
 
+        requested_quality = str(quality or "").strip().lower().rstrip("p")
+        if requested_quality not in QUALITY_CODES:
+            requested_quality = ""
+
+        now = time.monotonic()
+        stamp = f"{url}|{int(bool(audio_only))}|{requested_quality or self._quality}"
+        last = self._last_external
+        if last and last[0] == stamp and (now - last[1]) < 6:
+            return
+        self._last_external = (stamp, now)
+
         # Music links always go through audio pipeline.
         if "music.yandex." in url.lower():
             audio_only = True
 
-        requested_quality = str(quality or "").strip().lower().rstrip("p")
         if requested_quality in QUALITY_CODES:
             self._quality = requested_quality
             self._persist_quality()
@@ -1309,6 +1324,7 @@ class YouTubeDownloaderApp(tk.Tk):
         folder = extension_dir()
         folder.mkdir(parents=True, exist_ok=True)
         register_protocol()
+        register_native_host()
         with contextlib.suppress(OSError):
             os.startfile(folder)  # type: ignore[attr-defined]
 
@@ -1324,9 +1340,9 @@ class YouTubeDownloaderApp(tk.Tk):
             f"4. Выберите папку:\n{folder}\n\n"
             "На YouTube появится кнопка TubeSave; также работает иконка\n"
             "расширения на панели браузера.\n\n"
-            f"Приложение должно быть запущено (порт {BRIDGE_PORT}).\n"
-            "Протокол tubesave:// зарегистрирован — если TubeSave закрыт,\n"
-            "расширение попробует его открыть.",
+            f"Приложение можно не держать открытым: по кнопке «Скачать»\n"
+            "браузер сам запустит TubeSave (если спросит разрешение — «Открыть»).\n"
+            "Протокол tubesave:// регистрируется при каждом запуске.",
         )
 
     def _set_busy(self, busy: bool) -> None:
@@ -1595,21 +1611,38 @@ class YouTubeDownloaderApp(tk.Tk):
         threading.Thread(target=worker, daemon=True).start()
 
 
+def _handoff_to_running(pending: list[tuple[str, bool, bool, str]], timeout: float = 20.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if pending:
+            if all(try_handoff(url, auto, audio, quality) for url, auto, audio, quality in pending):
+                return True
+        elif is_bridge_alive() and try_focus():
+            return True
+        time.sleep(0.35)
+    if pending:
+        return all(try_handoff(url, auto, audio, quality) for url, auto, audio, quality in pending)
+    return is_bridge_alive() and try_focus()
+
+
 def main() -> None:
+    if "--native-messaging" in sys.argv:
+        run_native_host()
+        return
+
     pending = collect_launch_urls()
 
-    # Second instance: hand off URL(s) to the running app and exit.
-    if pending:
-        if all(try_handoff(url, auto, audio, quality) for url, auto, audio, quality in pending):
-            return
-    elif is_bridge_alive() and try_focus():
-        # Already running — just bring it forward.
+    if not acquire_instance_lock():
+        _handoff_to_running(pending)
         return
+
+    register_protocol()
+    register_native_host()
 
     app = YouTubeDownloaderApp()
     for url, auto, audio, quality in pending:
         app.after(
-            300,
+            400,
             lambda u=url, a=auto, au=audio, q=quality: app.receive_external_url(
                 u, auto_start=a, audio_only=au, quality=q
             ),

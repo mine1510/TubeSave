@@ -103,41 +103,62 @@ def _asset_url(assets: list[dict], name: str) -> str | None:
     return None
 
 
+def _info_from_update_json(data: dict) -> UpdateInfo:
+    app_ver = str(data.get("app") or data.get("app_version") or APP_VERSION)
+    ext_ver = str(
+        data.get("extension") or data.get("extension_version") or EXTENSION_VERSION
+    )
+    return UpdateInfo(
+        app_version=app_ver.lstrip("vV"),
+        extension_version=ext_ver.lstrip("vV"),
+        app_zip_url=data.get("app_zip") or data.get("app_download_url"),
+        extension_zip_url=data.get("extension_zip") or data.get("extension_download_url"),
+        notes=str(data.get("notes") or data.get("release_notes") or ""),
+        release_page=str(data.get("release_page") or RELEASES_PAGE),
+    )
+
+
 def fetch_update_info() -> UpdateInfo:
-    """Prefer update.json, fall back to GitHub Releases API."""
+    """Read all version sources and keep the newest app version."""
+    candidates: list[UpdateInfo] = []
+
     for url in (UPDATE_JSON_URL, UPDATE_JSON_URL_FALLBACK):
         try:
             data = _http_get_json(url)
             if data.get("app") or data.get("app_version"):
-                app_ver = str(data.get("app") or data.get("app_version") or APP_VERSION)
-                ext_ver = str(
-                    data.get("extension")
-                    or data.get("extension_version")
-                    or EXTENSION_VERSION
-                )
-                return UpdateInfo(
-                    app_version=app_ver.lstrip("vV"),
-                    extension_version=ext_ver.lstrip("vV"),
-                    app_zip_url=data.get("app_zip") or data.get("app_download_url"),
-                    extension_zip_url=data.get("extension_zip")
-                    or data.get("extension_download_url"),
-                    notes=str(data.get("notes") or data.get("release_notes") or ""),
-                    release_page=str(data.get("release_page") or RELEASES_PAGE),
-                )
+                candidates.append(_info_from_update_json(data))
         except (URLError, HTTPError, TimeoutError, OSError, json.JSONDecodeError):
             continue
 
-    data = _http_get_json(GITHUB_RELEASES_LATEST)
-    tag = str(data.get("tag_name") or APP_VERSION).lstrip("vV")
-    assets = data.get("assets") if isinstance(data.get("assets"), list) else []
-    return UpdateInfo(
-        app_version=tag,
-        extension_version=tag,
-        app_zip_url=_asset_url(assets, APP_ZIP_NAME),
-        extension_zip_url=_asset_url(assets, EXTENSION_ZIP_NAME),
-        notes=str(data.get("body") or "")[:500],
-        release_page=str(data.get("html_url") or RELEASES_PAGE),
-    )
+    try:
+        data = _http_get_json(GITHUB_RELEASES_LATEST)
+        tag = str(data.get("tag_name") or "").lstrip("vV")
+        if tag:
+            assets = data.get("assets") if isinstance(data.get("assets"), list) else []
+            candidates.append(
+                UpdateInfo(
+                    app_version=tag,
+                    extension_version=tag,
+                    app_zip_url=_asset_url(assets, APP_ZIP_NAME),
+                    extension_zip_url=_asset_url(assets, EXTENSION_ZIP_NAME),
+                    notes=str(data.get("body") or "")[:500],
+                    release_page=str(data.get("html_url") or RELEASES_PAGE),
+                )
+            )
+    except (URLError, HTTPError, TimeoutError, OSError, json.JSONDecodeError):
+        pass
+
+    if not candidates:
+        return UpdateInfo(
+            app_version=APP_VERSION,
+            extension_version=EXTENSION_VERSION,
+            app_zip_url=None,
+            extension_zip_url=None,
+            notes="",
+            release_page=RELEASES_PAGE,
+        )
+
+    return max(candidates, key=lambda item: _parse_version(item.app_version))
 
 
 def install_extension_update(
