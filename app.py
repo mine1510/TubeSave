@@ -1823,10 +1823,10 @@ class YouTubeDownloaderApp(tk.Tk):
                 else:
                     self._events.put(("done", (True, f"Видео сохранено:\n{filepath}")))
             except DownloadCancelled:
-                self._events.put(("cancelled", "Загрузка отменена"))
+                self._events.put(("cancelled", "Загрузка отменена, файлы удалены"))
             except Exception as exc:
                 if self._cancel_event.is_set():
-                    self._events.put(("cancelled", "Загрузка отменена"))
+                    self._events.put(("cancelled", "Загрузка отменена, файлы удалены"))
                     return
                 log_output = sink.getvalue().strip()
                 if log_output:

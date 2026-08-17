@@ -46,25 +46,76 @@ def _interruptible_sleep(seconds: float, cancel_event: Event | None) -> None:
         time.sleep(min(0.15, remaining))
 
 
+def _unlink_quiet(path: Path) -> None:
+    for _ in range(6):
+        try:
+            path.unlink(missing_ok=True)
+            return
+        except OSError:
+            time.sleep(0.12)
+
+
+class DownloadCleanup:
+    """Delete files created by the current download after the user cancels."""
+
+    def __init__(self, output_dir: Path) -> None:
+        self.output_dir = output_dir
+        output_dir.mkdir(parents=True, exist_ok=True)
+        self._before = {path.resolve() for path in output_dir.iterdir() if path.is_file()}
+        self._extra: set[Path] = set()
+
+    def track(self, raw: object) -> None:
+        if not raw:
+            return
+        path = Path(str(raw))
+        self._extra.add(path)
+        self._extra.add(Path(str(path) + ".part"))
+        if path.suffix:
+            self._extra.add(path.with_name(path.name + ".part"))
+
+    def track_hook(self, data: dict) -> None:
+        for key in ("filename", "tmpfilename", "filepath"):
+            self.track(data.get(key))
+        info = data.get("info_dict")
+        if isinstance(info, dict):
+            for key in ("filename", "filepath", "_filename"):
+                self.track(info.get(key))
+
+    def purge(self) -> None:
+        victims: set[Path] = set(self._extra)
+        if self.output_dir.exists():
+            for path in self.output_dir.iterdir():
+                if not path.is_file():
+                    continue
+                try:
+                    resolved = path.resolve()
+                except OSError:
+                    resolved = path
+                if resolved not in self._before:
+                    victims.add(path)
+        for path in victims:
+            _unlink_quiet(path)
+            _unlink_quiet(Path(str(path) + ".part"))
+
+
 def _delete_partial_files(data: dict) -> None:
     names: list[str] = []
-    for key in ("tmpfilename", "filename"):
+    for key in ("tmpfilename", "filename", "filepath"):
         raw = data.get(key)
         if raw:
             names.append(str(raw))
     for name in names:
-        path = Path(name)
-        try:
-            path.unlink(missing_ok=True)
-        except OSError:
-            pass
-        try:
-            Path(str(name) + ".part").unlink(missing_ok=True)
-        except OSError:
-            pass
+        _unlink_quiet(Path(name))
+        _unlink_quiet(Path(str(name) + ".part"))
 
 
-def _abort_if_cancelled(data: dict, cancel_event: Event | None) -> None:
+def _abort_if_cancelled(
+    data: dict,
+    cancel_event: Event | None,
+    cleanup: DownloadCleanup | None = None,
+) -> None:
+    if cleanup is not None:
+        cleanup.track_hook(data)
     if not _is_cancelled(cancel_event):
         return
     _delete_partial_files(data)
@@ -377,6 +428,7 @@ def build_ydl_opts(
     quality: str = "best",
     site: str | None = None,
     cancel_event: Event | None = None,
+    cleanup: DownloadCleanup | None = None,
 ) -> dict:
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -423,20 +475,24 @@ def build_ydl_opts(
         opts["impersonate"] = impersonate
 
     progress_hooks: list[ProgressCallback] = []
-    if cancel_event is not None:
-        progress_hooks.append(lambda data: _abort_if_cancelled(data, cancel_event))
+    if cleanup is not None or cancel_event is not None:
+        progress_hooks.append(
+            lambda data: _abort_if_cancelled(data, cancel_event, cleanup)
+        )
     if progress_hook is not None:
         progress_hooks.append(progress_hook)
     if progress_hooks:
         opts["progress_hooks"] = progress_hooks
 
     postprocessor_hooks: list[ProgressCallback] = []
-    if cancel_event is not None:
-        postprocessor_hooks.append(lambda data: _abort_if_cancelled(data, cancel_event))
+    if cleanup is not None or cancel_event is not None:
+        postprocessor_hooks.append(
+            lambda data: _abort_if_cancelled(data, cancel_event, cleanup)
+        )
     if status_callback is not None:
 
         def postprocessor_hook(data: dict) -> None:
-            _abort_if_cancelled(data, cancel_event)
+            _abort_if_cancelled(data, cancel_event, cleanup)
             status = data.get("status")
             postprocessor = data.get("postprocessor") or ""
             if status == "started":
@@ -739,33 +795,37 @@ def download_yandex_music(
     output_dir.mkdir(parents=True, exist_ok=True)
     filename = _safe_filename(f"{display} [{track_id}]") + f".{ext}"
     dest = output_dir / filename
+    cleanup = DownloadCleanup(output_dir)
+    cleanup.track(dest)
     report("Скачивание аудио…")
-    _download_binary(stream_url, dest, headers, progress_hook, cancel_event)
+    try:
+        _download_binary(stream_url, dest, headers, progress_hook, cancel_event)
 
-    albums = track.get("albums") or []
-    cover = ""
-    if albums and isinstance(albums[0], dict):
-        cover = str(albums[0].get("coverUri") or track.get("coverUri") or "")
-    else:
-        cover = str(track.get("coverUri") or "")
-    if cover:
-        if not cover.startswith("http"):
-            cover = "https://" + cover.replace("%%", "400x400")
+        albums = track.get("albums") or []
+        cover = ""
+        if albums and isinstance(albums[0], dict):
+            cover = str(albums[0].get("coverUri") or track.get("coverUri") or "")
         else:
-            cover = cover.replace("%%", "400x400")
-        thumb = dest.with_suffix(".jpg")
-        try:
-            report("Встраивание превью…")
-            _download_binary(cover, thumb, headers, None, cancel_event)
-            embed_thumbnail(dest, thumb, cancel_event)
-        except DownloadCancelled:
-            thumb.unlink(missing_ok=True)
-            if dest.exists():
-                return dest
-            raise
-        except Exception:
-            thumb.unlink(missing_ok=True)
-    return dest
+            cover = str(track.get("coverUri") or "")
+        if cover:
+            if not cover.startswith("http"):
+                cover = "https://" + cover.replace("%%", "400x400")
+            else:
+                cover = cover.replace("%%", "400x400")
+            thumb = dest.with_suffix(".jpg")
+            cleanup.track(thumb)
+            try:
+                report("Встраивание превью…")
+                _download_binary(cover, thumb, headers, None, cancel_event)
+                embed_thumbnail(dest, thumb, cancel_event)
+            except DownloadCancelled:
+                raise
+            except Exception:
+                thumb.unlink(missing_ok=True)
+        return dest
+    except DownloadCancelled:
+        cleanup.purge()
+        raise
 
 
 def download_video(
@@ -801,76 +861,80 @@ def download_video(
         if status_callback is not None:
             status_callback(message)
 
-    label = SITE_LABELS.get(site, "сайт")
-    report(f"Подключение к {label}…")
-    opts = build_ydl_opts(
-        output_dir,
-        progress_hook,
-        status_callback,
-        audio_only=audio_only,
-        quality=quality,
-        site=site,
-        cancel_event=cancel_event,
-    )
+    cleanup = DownloadCleanup(output_dir)
+    try:
+        label = SITE_LABELS.get(site, "сайт")
+        report(f"Подключение к {label}…")
+        opts = build_ydl_opts(
+            output_dir,
+            progress_hook,
+            status_callback,
+            audio_only=audio_only,
+            quality=quality,
+            site=site,
+            cancel_event=cancel_event,
+            cleanup=cleanup,
+        )
 
-    last_error: Exception | None = None
-    filepath: Path | None = None
-    for attempt in range(1, 4):
-        try:
-            if attempt > 1:
-                report(f"Повтор скачивания ({attempt}/3)…")
-                _interruptible_sleep(1.5 * attempt, cancel_event)
-            filepath = _try_download(
-                url, opts, report, audio_only=audio_only, cancel_event=cancel_event
-            )
-            break
-        except DownloadCancelled:
-            raise
-        except yt_dlp.utils.DownloadError as exc:
-            if _is_cancelled(cancel_event):
-                raise DownloadCancelled("Загрузка отменена") from None
-            last_error = exc
-            message = str(exc)
-            # Retry only for transient CDN blocks; other errors fail fast.
-            if "403" not in message and "Forbidden" not in message:
+        last_error: Exception | None = None
+        filepath: Path | None = None
+        for attempt in range(1, 4):
+            try:
+                if attempt > 1:
+                    report(f"Повтор скачивания ({attempt}/3)…")
+                    _interruptible_sleep(1.5 * attempt, cancel_event)
+                filepath = _try_download(
+                    url, opts, report, audio_only=audio_only, cancel_event=cancel_event
+                )
+                break
+            except DownloadCancelled:
                 raise
+            except yt_dlp.utils.DownloadError as exc:
+                if _is_cancelled(cancel_event):
+                    raise DownloadCancelled("Загрузка отменена") from None
+                last_error = exc
+                message = str(exc)
+                # Retry only for transient CDN blocks; other errors fail fast.
+                if "403" not in message and "Forbidden" not in message:
+                    raise
 
-    if filepath is None:
-        report("Обход блокировки…")
-        fallback = dict(opts)
-        fallback["format"] = fallback_format_selector(audio_only=audio_only, quality=quality)
-        if site == "youtube":
-            fallback["extractor_args"] = {
-                "youtube": {"player_client": ["android", "android_sdkless"]},
-            }
-        try:
-            filepath = _try_download(
-                url, fallback, report, audio_only=audio_only, cancel_event=cancel_event
-            )
-        except DownloadCancelled:
-            raise
-        except Exception:
-            if _is_cancelled(cancel_event):
-                raise DownloadCancelled("Загрузка отменена") from None
-            assert last_error is not None
-            raise last_error from None
+        if filepath is None:
+            report("Обход блокировки…")
+            fallback = dict(opts)
+            fallback["format"] = fallback_format_selector(audio_only=audio_only, quality=quality)
+            if site == "youtube":
+                fallback["extractor_args"] = {
+                    "youtube": {"player_client": ["android", "android_sdkless"]},
+                }
+            try:
+                filepath = _try_download(
+                    url, fallback, report, audio_only=audio_only, cancel_event=cancel_event
+                )
+            except DownloadCancelled:
+                raise
+            except Exception:
+                if _is_cancelled(cancel_event):
+                    raise DownloadCancelled("Загрузка отменена") from None
+                assert last_error is not None
+                raise last_error from None
 
-    report("Проверка результата…")
-    if audio_only:
-        if filepath.suffix.lower() not in {".m4a", ".mp3", ".aac"}:
-            m4a_path = filepath.with_suffix(".m4a")
-            if m4a_path.exists():
-                filepath = m4a_path
-    elif filepath.suffix.lower() != ".mp4":
-        mp4_path = filepath.with_suffix(".mp4")
-        if mp4_path.exists():
-            filepath = mp4_path
+        report("Проверка результата…")
+        if audio_only:
+            if filepath.suffix.lower() not in {".m4a", ".mp3", ".aac"}:
+                m4a_path = filepath.with_suffix(".m4a")
+                if m4a_path.exists():
+                    filepath = m4a_path
+        elif filepath.suffix.lower() != ".mp4":
+            mp4_path = filepath.with_suffix(".mp4")
+            if mp4_path.exists():
+                filepath = mp4_path
 
-    # Cover embed is mainly useful for video/audio containers.
-    if filepath.suffix.lower() in {".mp4", ".m4a", ".mkv", ".webm", ".mp3"}:
-        try:
+        cleanup.track(filepath)
+        # Cover embed is mainly useful for video/audio containers.
+        if filepath.suffix.lower() in {".mp4", ".m4a", ".mkv", ".webm", ".mp3"}:
             report("Встраивание превью…")
             filepath = embed_thumbnail(filepath, cancel_event=cancel_event)
-        except DownloadCancelled:
-            return filepath
-    return filepath
+        return filepath
+    except DownloadCancelled:
+        cleanup.purge()
+        raise
