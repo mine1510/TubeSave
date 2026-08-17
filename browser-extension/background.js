@@ -236,7 +236,8 @@ const UPDATE_JSON_URLS = [
   "https://raw.githubusercontent.com/mine1510/TubeSave/master/update.json",
   "https://raw.githubusercontent.com/mine1510/TubeSave/cursor/quality-audio-theme-ui/update.json",
 ];
-const RELEASES_PAGE = "https://github.com/mine1510/TubeSave/releases/latest";
+const GITHUB_RELEASES_LATEST =
+  "https://api.github.com/repos/mine1510/TubeSave/releases/latest";
 const LOCAL_EXT_VERSION = chrome.runtime.getManifest().version;
 
 function parseVersion(text) {
@@ -259,20 +260,181 @@ function isNewer(remote, local) {
   return false;
 }
 
+function newerManifest(a, b) {
+  const extA = String((a && (a.extension || a.extension_version)) || "");
+  const extB = String((b && (b.extension || b.extension_version)) || "");
+  const appA = String((a && (a.app || a.app_version)) || "");
+  const appB = String((b && (b.app || b.app_version)) || "");
+  if (isNewer(extA, extB)) return a;
+  if (isNewer(extB, extA)) return b;
+  if (isNewer(appA, appB)) return a;
+  return b;
+}
+
+async function fetchLatestReleaseManifest() {
+  const res = await fetch(GITHUB_RELEASES_LATEST, { cache: "no-store" });
+  if (!res.ok) {
+    return null;
+  }
+  const data = await res.json();
+  const tag = String(data.tag_name || "").replace(/^v/i, "");
+  if (!tag) {
+    return null;
+  }
+  const assets = Array.isArray(data.assets) ? data.assets : [];
+  const ext = assets.find((item) => item && item.name === "TubeSave-Extension.zip");
+  const app = assets.find((item) => item && item.name === "TubeSave-Windows.zip");
+  return {
+    app: tag,
+    extension: tag,
+    app_zip: app && app.browser_download_url,
+    extension_zip: ext && ext.browser_download_url,
+  };
+}
+
 async function fetchUpdateJson() {
+  const candidates = [];
   for (const url of UPDATE_JSON_URLS) {
     try {
       const res = await fetch(url, { cache: "no-store" });
       if (!res.ok) continue;
       const data = await res.json();
       if (data && (data.extension || data.extension_version || data.app)) {
-        return data;
+        candidates.push(data);
       }
     } catch {
       // try next
     }
   }
-  return null;
+  try {
+    const release = await fetchLatestReleaseManifest();
+    if (release) {
+      candidates.push(release);
+    }
+  } catch {
+    // ignore
+  }
+  if (!candidates.length) {
+    return null;
+  }
+  return candidates.reduce(newerManifest);
+}
+
+function openUpdateLauncher() {
+  const page = chrome.runtime.getURL("launch.html") + "?mode=update";
+  chrome.windows.create(
+    { url: page, type: "popup", width: 440, height: 180, focused: true },
+    (win) => {
+      if (chrome.runtime.lastError) {
+        chrome.tabs.create({ url: page, active: true });
+      }
+      const windowId = win && win.id;
+      setTimeout(() => {
+        if (windowId != null) {
+          chrome.windows.remove(windowId).catch(() => {});
+        }
+      }, 8000);
+    }
+  );
+}
+
+async function ensureAppForUpdate() {
+  if (await pingBridge()) {
+    return true;
+  }
+  try {
+    const native = await sendNativeMessageUpdate();
+    if (!(native && native.ok)) {
+      openUpdateLauncher();
+    }
+  } catch {
+    openUpdateLauncher();
+  }
+  return waitForBridge(25000);
+}
+
+function sendNativeMessageUpdate() {
+  return new Promise((resolve, reject) => {
+    if (!chrome.runtime.sendNativeMessage) {
+      reject(new Error("nativeMessaging unavailable"));
+      return;
+    }
+    chrome.runtime.sendNativeMessage("com.tubesave.host", { action: "update" }, (response) => {
+      if (chrome.runtime.lastError) {
+        reject(new Error(chrome.runtime.lastError.message));
+        return;
+      }
+      resolve(response || {});
+    });
+  });
+}
+
+async function applyUpdatesViaBridge(zipUrl) {
+  const checkRes = await fetch(`${BRIDGE}/check-update`, { cache: "no-store" });
+  if (checkRes.ok) {
+    const check = await checkRes.json();
+    if (check && (check.app_update || check.extension_update)) {
+      const apply = await fetch(`${BRIDGE}/apply-updates`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+      });
+      if (apply.ok) {
+        return apply.json();
+      }
+    }
+  }
+  return applyExtensionUpdateViaBridge(zipUrl);
+}
+
+async function checkAndUpdateExtension() {
+  const remote = await fetchUpdateJson();
+  if (!remote) {
+    return { ok: false, reason: "no-manifest" };
+  }
+  const remoteExt = String(
+    remote.extension || remote.extension_version || ""
+  ).replace(/^v/i, "");
+  const remoteApp = String(remote.app || remote.app_version || "").replace(/^v/i, "");
+  const needExt = Boolean(remoteExt && isNewer(remoteExt, LOCAL_EXT_VERSION));
+  const needApp = Boolean(remoteApp && isNewer(remoteApp, LOCAL_EXT_VERSION));
+  if (!needExt && !needApp) {
+    return { ok: true, update: false, local: LOCAL_EXT_VERSION, remote: remoteExt };
+  }
+
+  await setBadge("UP", "#C45C26");
+  const zipUrl = remote.extension_zip || remote.extension_download_url || "";
+
+  if (!(await pingBridge())) {
+    const started = await ensureAppForUpdate();
+    if (!started) {
+      await setBadge("!", "#B00020");
+      return { ok: false, reason: "app-not-started", local: LOCAL_EXT_VERSION, remote: remoteExt };
+    }
+  }
+
+  try {
+    await applyUpdatesViaBridge(zipUrl);
+    await setBadge("OK", "#1B7F4B");
+    setTimeout(() => {
+      try {
+        chrome.runtime.reload();
+      } catch (err) {
+        console.warn(err);
+      }
+    }, 2500);
+    return {
+      ok: true,
+      update: true,
+      applied: true,
+      local: LOCAL_EXT_VERSION,
+      remote: remoteExt,
+    };
+  } catch (err) {
+    console.warn("update failed", err);
+    await setBadge("!", "#B00020");
+    return { ok: false, reason: "apply-failed", error: String(err && err.message ? err.message : err) };
+  }
 }
 
 async function applyExtensionUpdateViaBridge(zipUrl) {
@@ -289,58 +451,6 @@ async function applyExtensionUpdateViaBridge(zipUrl) {
     throw new Error(data.error || "update failed");
   }
   return data;
-}
-
-async function checkAndUpdateExtension() {
-  const remote = await fetchUpdateJson();
-  if (!remote) {
-    return { ok: false, reason: "no-manifest" };
-  }
-  const remoteExt = String(
-    remote.extension || remote.extension_version || ""
-  ).replace(/^v/i, "");
-  if (!remoteExt || !isNewer(remoteExt, LOCAL_EXT_VERSION)) {
-    return { ok: true, update: false, local: LOCAL_EXT_VERSION, remote: remoteExt };
-  }
-
-  await setBadge("UP", "#C45C26");
-  const zipUrl = remote.extension_zip || remote.extension_download_url || "";
-
-  if (await pingBridge()) {
-    try {
-      await applyExtensionUpdateViaBridge(zipUrl);
-      await setBadge("OK", "#1B7F4B");
-      setTimeout(() => {
-        try {
-          chrome.runtime.reload();
-        } catch (err) {
-          console.warn(err);
-        }
-      }, 900);
-      return {
-        ok: true,
-        update: true,
-        applied: true,
-        local: LOCAL_EXT_VERSION,
-        remote: remoteExt,
-      };
-    } catch (err) {
-      console.warn("bridge update failed", err);
-    }
-  }
-
-  // App not running / update failed — open release page for manual install.
-  chrome.tabs.create({
-    url: remote.release_page || RELEASES_PAGE,
-    active: false,
-  });
-  return {
-    ok: true,
-    update: true,
-    applied: false,
-    local: LOCAL_EXT_VERSION,
-    remote: remoteExt,
-  };
 }
 
 function scheduleUpdateChecks() {

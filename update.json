@@ -1,7 +1,7 @@
 {
-  "app": "1.3.2",
-  "extension": "1.3.2",
-  "notes": "Кнопка «Скачать» в браузере сама запускает TubeSave, если приложение закрыто.",
+  "app": "1.3.3",
+  "extension": "1.3.3",
+  "notes": "Обновление ставится само, без открытия GitHub. Плагин запускает TubeSave, если он закрыт.",
   "release_page": "https://github.com/mine1510/TubeSave/releases/latest",
   "app_zip": "https://github.com/mine1510/TubeSave/releases/latest/download/TubeSave-Windows.zip",
   "extension_zip": "https://github.com/mine1510/TubeSave/releases/latest/download/TubeSave-Extension.zip"

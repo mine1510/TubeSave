@@ -27,10 +27,12 @@ from bridge import (
     collect_launch_urls,
     extension_dir,
     is_bridge_alive,
+    is_update_launch,
     register_native_host,
     register_protocol,
     run_native_host,
     start_bridge,
+    try_apply_updates,
     try_handoff,
     try_focus,
 )
@@ -473,8 +475,9 @@ class Card(tk.Frame):
 
 
 class YouTubeDownloaderApp(tk.Tk):
-    def __init__(self) -> None:
+    def __init__(self, apply_update_on_start: bool = False) -> None:
         super().__init__()
+        self._apply_update_on_start = apply_update_on_start
         self.title(f"TubeSave {APP_VERSION}")
         self.resizable(True, True)
 
@@ -519,6 +522,7 @@ class YouTubeDownloaderApp(tk.Tk):
             on_check_update=self._bridge_check_update,
             on_update_extension=self._bridge_update_extension,
             on_update_app=self._bridge_update_app,
+            on_apply_updates=self._bridge_apply_updates,
         )
         register_protocol()
         register_native_host()
@@ -527,8 +531,10 @@ class YouTubeDownloaderApp(tk.Tk):
         self._tray_thread = None
         self._tray_notified = bool(self._settings.get("tray_hint_shown"))
         self._update_info = None
+        self._update_applying = False
         self._ensure_tray()
-        self.after(2500, self._check_updates_silent)
+        delay = 800 if getattr(self, "_apply_update_on_start", False) else 2500
+        self.after(delay, self._check_updates_silent)
 
 
     def _persist_folder(self, folder: str | Path) -> None:
@@ -1088,6 +1094,17 @@ class YouTubeDownloaderApp(tk.Tk):
         self.after(0, apply)
         return {"ok": True, "queued": True}
 
+    def _bridge_apply_updates(self) -> dict:
+        info = fetch_update_info()
+        self._update_info = info
+        self.after(0, lambda: self._auto_apply_update(info))
+        return {
+            "ok": True,
+            "queued": True,
+            "app_update": info.app_update_available,
+            "extension_update": info.extension_update_available,
+        }
+
     def _check_updates_silent(self) -> None:
         self.after(6 * 60 * 60 * 1000, self._check_updates_silent)
 
@@ -1106,6 +1123,12 @@ class YouTubeDownloaderApp(tk.Tk):
         if self._is_busy:
             self.after(5 * 60 * 1000, lambda: self._auto_apply_update(info))
             return
+        if not (info.app_update_available or info.extension_update_available):
+            self.status_var.set("Версия актуальна")
+            return
+        if self._update_applying:
+            return
+        self._update_applying = True
         parts = []
         if info.app_update_available:
             parts.append(f"приложение {APP_VERSION} → {info.app_version}")
@@ -1141,6 +1164,7 @@ class YouTubeDownloaderApp(tk.Tk):
                 )
                 self.after(0, lambda: self.status_var.set("Плагин обновлён"))
             except Exception as exc:
+                self._update_applying = False
                 self.after(0, lambda: messagebox.showerror("Обновление", str(exc)))
 
         threading.Thread(target=worker, daemon=True, name="TubeSaveApplyUpdate").start()
@@ -1631,15 +1655,24 @@ def main() -> None:
         return
 
     pending = collect_launch_urls()
+    want_update = any(is_update_launch(arg) for arg in sys.argv[1:])
 
     if not acquire_instance_lock():
+        if want_update:
+            deadline = time.monotonic() + 20
+            while time.monotonic() < deadline:
+                if try_apply_updates():
+                    return
+                time.sleep(0.35)
+            _handoff_to_running(pending)
+            return
         _handoff_to_running(pending)
         return
 
     register_protocol()
     register_native_host()
 
-    app = YouTubeDownloaderApp()
+    app = YouTubeDownloaderApp(apply_update_on_start=want_update)
     for url, auto, audio, quality in pending:
         app.after(
             400,

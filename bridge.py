@@ -219,10 +219,13 @@ def launch_app_detached(
     auto_start: bool = True,
     audio_only: bool = False,
     quality: str = "best",
+    extra_args: list[str] | None = None,
 ) -> None:
     """Start TubeSave in a new process (used by the native messaging host)."""
-    args: list[str]
-    if url:
+    extra: list[str]
+    if extra_args:
+        extra = list(extra_args)
+    elif url:
         protocol = (
             "tubesave://download?"
             f"url={quote(url, safe='')}&auto={1 if auto_start else 0}"
@@ -273,10 +276,17 @@ def run_native_host() -> None:
         data = {}
 
     url = str(data.get("url") or "").strip()
+    action = str(data.get("action") or "").strip().lower()
     auto = _as_bool(data.get("auto", data.get("auto_start", True)), True)
     audio = _as_bool(data.get("audio", data.get("audio_only")), "music.yandex." in url.lower())
     quality = _normalize_quality(data.get("quality") or "best")
-    if is_bridge_alive():
+    if action == "update":
+        if is_bridge_alive():
+            payload = {"ok": True, "alive": True, "apply": try_apply_updates()}
+        else:
+            launch_app_detached(extra_args=["tubesave://update"])
+            payload = {"ok": True, "launched": True, "action": "update"}
+    elif is_bridge_alive():
         ok = try_handoff(url, auto, audio, quality) if url else try_focus()
         payload = {"ok": True, "alive": True, "handed": bool(ok)}
     else:
@@ -330,6 +340,19 @@ def parse_incoming_arg(raw: str) -> tuple[str | None, bool, bool, str]:
     return None, True, False, "best"
 
 
+def is_update_launch(raw: str) -> bool:
+    text = (raw or "").strip().strip('"').lower()
+    if text in {"--update", "/update"}:
+        return True
+    if not text.startswith("tubesave:"):
+        return False
+    rest = text.split(":", 1)[1]
+    if rest.startswith("//"):
+        rest = rest[2:]
+    path = rest.split("?", 1)[0].strip("/")
+    return path == "update"
+
+
 def collect_launch_urls(argv: list[str] | None = None) -> list[tuple[str, bool, bool, str]]:
     args = list(sys.argv[1:] if argv is None else argv)
     found: list[tuple[str, bool, bool, str]] = []
@@ -373,6 +396,24 @@ def try_handoff(
         return False
 
 
+def try_apply_updates() -> bool:
+    req = Request(
+        f"{BRIDGE_BASE}/apply-updates",
+        data=b"{}",
+        headers={
+            "Content-Type": "application/json",
+            "Origin": "tubesave-local",
+        },
+        method="POST",
+    )
+    try:
+        with urlopen(req, timeout=2.0) as resp:
+            data = json.loads(resp.read().decode("utf-8", errors="replace"))
+            return bool(data.get("ok"))
+    except (URLError, TimeoutError, OSError, json.JSONDecodeError):
+        return False
+
+
 def is_bridge_alive() -> bool:
     try:
         with urlopen(f"{BRIDGE_BASE}/ping", timeout=0.8) as resp:
@@ -388,6 +429,7 @@ _BRIDGE_CALLBACKS: dict[str, Callable | None] = {
     "on_update_extension": None,
     "on_update_app": None,
     "on_check_update": None,
+    "on_apply_updates": None,
 }
 
 
@@ -528,6 +570,18 @@ class _BridgeHandler(BaseHTTPRequestHandler):
                 self._json(500, {"ok": False, "error": str(exc)})
             return
 
+        if parsed.path == "/apply-updates":
+            cb = _BRIDGE_CALLBACKS.get("on_apply_updates")
+            if cb is None:
+                self._json(503, {"ok": False, "error": "updater unavailable"})
+                return
+            try:
+                result = cb()
+                self._json(200, result if isinstance(result, dict) else {"ok": True})
+            except Exception as exc:
+                self._json(500, {"ok": False, "error": str(exc)})
+            return
+
         self._json(404, {"ok": False, "error": "not found"})
 
 
@@ -547,12 +601,14 @@ def start_bridge(
     on_check_update: Callable[[], dict] | None = None,
     on_update_extension: Callable[[str | None], dict] | None = None,
     on_update_app: Callable[[str | None], dict] | None = None,
+    on_apply_updates: Callable[[], dict] | None = None,
 ) -> ThreadingHTTPServer | None:
     _BRIDGE_CALLBACKS["on_url"] = on_url
     _BRIDGE_CALLBACKS["on_focus"] = on_focus
     _BRIDGE_CALLBACKS["on_check_update"] = on_check_update
     _BRIDGE_CALLBACKS["on_update_extension"] = on_update_extension
     _BRIDGE_CALLBACKS["on_update_app"] = on_update_app
+    _BRIDGE_CALLBACKS["on_apply_updates"] = on_apply_updates
     try:
         server = ThreadingHTTPServer((BRIDGE_HOST, BRIDGE_PORT), _BridgeHandler)
     except OSError:

@@ -277,8 +277,16 @@ def install_app_update(
     lines = [
         "@echo off",
         "setlocal",
+        "set n=0",
         "timeout /t 2 /nobreak >nul",
+        ":copy_exe",
         f'copy /Y "{q(new_exe)}" "{q(target_exe)}" >nul',
+        "if errorlevel 1 (",
+        "  set /a n+=1",
+        "  if %n% geq 15 goto copy_fail",
+        "  timeout /t 1 /nobreak >nul",
+        "  goto copy_exe",
+        ")",
     ]
     if new_ext.exists():
         lines.append(
@@ -289,6 +297,10 @@ def install_app_update(
             f'start "" "{q(target_exe)}"',
             f'rmdir /S /Q "{q(staging)}" >nul 2>&1',
             "endlocal",
+            "exit /b 0",
+            ":copy_fail",
+            "endlocal",
+            "exit /b 1",
         ]
     )
     bat.write_text("\r\n".join(lines) + "\r\n", encoding="utf-8")
