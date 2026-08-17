@@ -36,7 +36,7 @@
     btn.id = BTN_ID;
     btn.type = "button";
     btn.textContent = label;
-    btn.title = "Скачать в TubeSave";
+    btn.title = "Скачать видео: выбрать качество и формат";
     Object.assign(btn.style, {
       display: "inline-flex",
       alignItems: "center",
@@ -62,7 +62,7 @@
     btn.id = FLOAT_ID;
     btn.type = "button";
     btn.textContent = label;
-    btn.title = "Скачать клип/видео в TubeSave";
+    btn.title = "Скачать клип/видео: выбрать качество и формат";
     Object.assign(btn.style, {
       position: "fixed",
       right: "18px",
@@ -83,39 +83,9 @@
     });
   }
 
-  function flash(btn, text, bg) {
-    const prev = btn.textContent;
-    const prevBg = btn.style.background;
-    btn.textContent = text;
-    btn.style.background = bg;
-    setTimeout(() => {
-      btn.textContent = prev;
-      btn.style.background = prevBg;
-    }, 1400);
-  }
-
-  async function onClick(ev) {
-    ev.preventDefault();
-    ev.stopPropagation();
-    const btn = ev.currentTarget;
-    btn.disabled = true;
-    try {
-      const response = await chrome.runtime.sendMessage({
-        type: "tubesave-download",
-        url: currentMediaUrl(),
-        audio_only: false,
-      });
-      if (response && response.ok) {
-        flash(btn, "Отправлено", "#1B7F4B");
-      } else {
-        flash(btn, "Ошибка", "#B00020");
-        console.warn(response && response.error);
-      }
-    } catch (err) {
-      flash(btn, "Ошибка", "#B00020");
-      console.warn(err);
-    } finally {
-      btn.disabled = false;
+  function attachPicker(btn) {
+    if (window.TubeSavePicker) {
+      window.TubeSavePicker.bindPicker(btn, currentMediaUrl);
     }
   }
 
@@ -131,13 +101,14 @@
   }
 
   function label() {
-    return isClipPage() ? "TubeSave Клип" : "TubeSave";
+    return isClipPage() ? "Скачать клип" : "Скачать видео";
   }
 
   function ensureButtons() {
     if (!isVideoPage()) {
       document.getElementById(BTN_ID)?.remove();
       document.getElementById(FLOAT_ID)?.remove();
+      if (window.TubeSavePicker) window.TubeSavePicker.closeMenu();
       return;
     }
 
@@ -145,14 +116,14 @@
     if (host && !document.getElementById(BTN_ID)) {
       const btn = document.createElement("button");
       styleInline(btn, label());
-      btn.addEventListener("click", onClick);
+      attachPicker(btn);
       host.appendChild(btn);
     }
 
     if (!document.getElementById(FLOAT_ID)) {
       const fab = document.createElement("button");
       styleFloat(fab, isClipPage() ? "↓ Клип" : "↓ VK");
-      fab.addEventListener("click", onClick);
+      attachPicker(fab);
       document.documentElement.appendChild(fab);
     } else {
       const fab = document.getElementById(FLOAT_ID);

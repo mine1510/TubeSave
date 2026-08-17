@@ -16,7 +16,19 @@ BRIDGE_HOST = "127.0.0.1"
 BRIDGE_PORT = 17834
 BRIDGE_BASE = f"http://{BRIDGE_HOST}:{BRIDGE_PORT}"
 
-UrlHandler = Callable[[str, bool, bool], None]
+UrlHandler = Callable[[str, bool, bool, str], None]
+
+
+KNOWN_QUALITIES = {"best", "2160", "1440", "1080", "720", "480", "360"}
+
+
+def _normalize_quality(value: object) -> str:
+    text = str(value or "best").strip().lower().rstrip("p")
+    if text in {"max", "highest", "best"}:
+        return "best"
+    if text in KNOWN_QUALITIES:
+        return text
+    return "best"
 
 
 def _as_bool(value: object, default: bool = True) -> bool:
@@ -76,18 +88,18 @@ def register_protocol() -> bool:
         return False
 
 
-def parse_incoming_arg(raw: str) -> tuple[str | None, bool, bool]:
+def parse_incoming_arg(raw: str) -> tuple[str | None, bool, bool, str]:
     """
-    Parse CLI / protocol argument into (url, auto_start, audio_only).
+    Parse CLI / protocol argument into (url, auto_start, audio_only, quality).
     Supports:
       https://...
-      tubesave://download?url=...&audio=1
+      tubesave://download?url=...&audio=1&quality=1080
       tubesave://add?url=...&auto=0
       tubesave://https://...
     """
     text = (raw or "").strip().strip('"')
     if not text:
-        return None, True, False
+        return None, True, False, "best"
 
     lower = text.lower()
     if lower.startswith("tubesave:"):
@@ -96,40 +108,51 @@ def parse_incoming_arg(raw: str) -> tuple[str | None, bool, bool]:
             rest = rest[2:]
         if rest.lower().startswith(("http://", "https://")):
             audio = "music.yandex." in rest.lower()
-            return rest, True, audio
+            return rest, True, audio, "best"
         query = rest.split("?", 1)[1] if "?" in rest else ""
         qs = parse_qs(query)
         url = (qs.get("url") or [None])[0]
         if not url:
-            return None, True, False
+            return None, True, False, "best"
         url = unquote(url)
         auto = _as_bool((qs.get("auto") or qs.get("auto_start") or ["1"])[0], True)
         audio = _as_bool(
             (qs.get("audio") or qs.get("audio_only") or [None])[0],
             default="music.yandex." in url.lower(),
         )
-        return url, auto, audio
+        quality = _normalize_quality((qs.get("quality") or qs.get("q") or ["best"])[0])
+        return url, auto, audio, quality
 
     if lower.startswith("http://") or lower.startswith("https://"):
-        return text, True, "music.yandex." in lower
+        return text, True, "music.yandex." in lower, "best"
 
-    return None, True, False
+    return None, True, False, "best"
 
 
-def collect_launch_urls(argv: list[str] | None = None) -> list[tuple[str, bool, bool]]:
+def collect_launch_urls(argv: list[str] | None = None) -> list[tuple[str, bool, bool, str]]:
     args = list(sys.argv[1:] if argv is None else argv)
-    found: list[tuple[str, bool, bool]] = []
+    found: list[tuple[str, bool, bool, str]] = []
     for arg in args:
-        url, auto, audio = parse_incoming_arg(arg)
+        url, auto, audio, quality = parse_incoming_arg(arg)
         if url:
-            found.append((url, auto, audio))
+            found.append((url, auto, audio, quality))
     return found
 
 
-def try_handoff(url: str, auto_start: bool = True, audio_only: bool = False) -> bool:
+def try_handoff(
+    url: str,
+    auto_start: bool = True,
+    audio_only: bool = False,
+    quality: str = "best",
+) -> bool:
     """Send URL to an already running TubeSave. Returns True on success."""
     payload = json.dumps(
-        {"url": url, "auto_start": auto_start, "audio_only": audio_only}
+        {
+            "url": url,
+            "auto_start": auto_start,
+            "audio_only": audio_only,
+            "quality": _normalize_quality(quality),
+        }
     ).encode("utf-8")
     req = Request(
         f"{BRIDGE_BASE}/download",
@@ -244,12 +267,13 @@ class _BridgeHandler(BaseHTTPRequestHandler):
                 (qs.get("audio") or qs.get("audio_only") or [None])[0],
                 default="music.yandex." in url.lower(),
             )
+            quality = _normalize_quality((qs.get("quality") or qs.get("q") or ["best"])[0])
             if not url:
                 self._json(400, {"ok": False, "error": "missing url"})
                 return
             cb = _BRIDGE_CALLBACKS.get("on_url")
             if cb is not None:
-                cb(url, auto, audio)
+                cb(url, auto, audio, quality)
             self._json(200, {"ok": True, "queued": True})
             return
         self._json(404, {"ok": False, "error": "not found"})
@@ -266,12 +290,13 @@ class _BridgeHandler(BaseHTTPRequestHandler):
             auto = _as_bool(data.get("auto_start", data.get("auto", True)), True)
             audio_default = "music.yandex." in url.lower()
             audio = _as_bool(data.get("audio_only", data.get("audio")), audio_default)
+            quality = _normalize_quality(data.get("quality") or data.get("q") or "best")
             if not url:
                 self._json(400, {"ok": False, "error": "missing url"})
                 return
             cb = _BRIDGE_CALLBACKS.get("on_url")
             if cb is not None:
-                cb(url, auto, audio)
+                cb(url, auto, audio, quality)
             self._json(200, {"ok": True, "queued": True})
             return
 

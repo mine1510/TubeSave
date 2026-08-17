@@ -11,7 +11,6 @@
     if (/\/watch\?/.test(href) || /\/shorts\//.test(href)) {
       return href;
     }
-    // Shorts sometimes keep id only in pathname after SPA nav
     const m = location.pathname.match(/\/shorts\/([A-Za-z0-9_-]+)/);
     if (m) {
       return `https://www.youtube.com/shorts/${m[1]}`;
@@ -23,8 +22,8 @@
     btn.id = BTN_ID;
     btn.type = "button";
     btn.textContent = label;
-    btn.title = "Скачать в TubeSave";
-    btn.setAttribute("aria-label", "Скачать в TubeSave");
+    btn.title = "Скачать видео: выбрать качество и формат";
+    btn.setAttribute("aria-label", "Скачать видео");
     Object.assign(btn.style, {
       display: "inline-flex",
       alignItems: "center",
@@ -50,7 +49,7 @@
     btn.id = FLOAT_ID;
     btn.type = "button";
     btn.textContent = label;
-    btn.title = "Скачать Shorts в TubeSave";
+    btn.title = "Скачать Shorts: выбрать качество и формат";
     Object.assign(btn.style, {
       position: "fixed",
       right: "18px",
@@ -71,39 +70,9 @@
     });
   }
 
-  function flash(btn, text, bg) {
-    const prev = btn.textContent;
-    const prevBg = btn.style.background;
-    btn.textContent = text;
-    btn.style.background = bg;
-    setTimeout(() => {
-      btn.textContent = prev;
-      btn.style.background = prevBg;
-    }, 1400);
-  }
-
-  async function onClick(ev) {
-    ev.preventDefault();
-    ev.stopPropagation();
-    const btn = ev.currentTarget;
-    btn.disabled = true;
-    try {
-      const response = await chrome.runtime.sendMessage({
-        type: "tubesave-download",
-        url: currentWatchUrl(),
-        audio_only: false,
-      });
-      if (response && response.ok) {
-        flash(btn, "Отправлено", "#1B7F4B");
-      } else {
-        flash(btn, "Ошибка", "#B00020");
-        console.warn(response && response.error);
-      }
-    } catch (err) {
-      flash(btn, "Ошибка", "#B00020");
-      console.warn(err);
-    } finally {
-      btn.disabled = false;
+  function attachPicker(btn) {
+    if (window.TubeSavePicker) {
+      window.TubeSavePicker.bindPicker(btn, currentWatchUrl);
     }
   }
 
@@ -134,8 +103,8 @@
       return false;
     }
     const btn = document.createElement("button");
-    styleInline(btn, isShortsPage() ? "TubeSave Shorts" : "TubeSave");
-    btn.addEventListener("click", onClick);
+    styleInline(btn, isShortsPage() ? "Скачать Shorts" : "Скачать видео");
+    attachPicker(btn);
     host.appendChild(btn);
     return true;
   }
@@ -151,7 +120,7 @@
     }
     const btn = document.createElement("button");
     styleFloat(btn, "↓ Shorts");
-    btn.addEventListener("click", onClick);
+    attachPicker(btn);
     document.documentElement.appendChild(btn);
   }
 
@@ -177,6 +146,7 @@
       lastHref = location.href;
       document.getElementById(BTN_ID)?.remove();
       document.getElementById(FLOAT_ID)?.remove();
+      if (window.TubeSavePicker) window.TubeSavePicker.closeMenu();
       ensureButton();
     }
   }, 700);

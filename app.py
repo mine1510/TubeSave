@@ -1284,12 +1284,21 @@ class YouTubeDownloaderApp(tk.Tk):
             self._bridge = None
         self.destroy()
 
-    def _on_bridge_url(self, url: str, auto_start: bool, audio_only: bool = False) -> None:
+    def _on_bridge_url(
+        self,
+        url: str,
+        auto_start: bool,
+        audio_only: bool = False,
+        quality: str = "best",
+    ) -> None:
         # HTTP thread → UI thread
         self.after(
             0,
             lambda: self.receive_external_url(
-                url, auto_start=auto_start, audio_only=audio_only
+                url,
+                auto_start=auto_start,
+                audio_only=audio_only,
+                quality=quality,
             ),
         )
 
@@ -1311,6 +1320,7 @@ class YouTubeDownloaderApp(tk.Tk):
         *,
         auto_start: bool = True,
         audio_only: bool = False,
+        quality: str | None = None,
     ) -> None:
         """Fill the URL field from browser extension / protocol / second instance."""
         url = (url or "").strip()
@@ -1321,11 +1331,22 @@ class YouTubeDownloaderApp(tk.Tk):
         if "music.yandex." in url.lower():
             audio_only = True
 
+        requested_quality = str(quality or "").strip().lower().rstrip("p")
+        if requested_quality in QUALITY_CODES:
+            self._quality = requested_quality
+            self._persist_quality()
+            for chip in getattr(self, "_quality_chips", []):
+                chip.set_selected(chip.code == self._quality)
+
         self._bring_to_front()
         self.url_var.set(url)
-        kind = "аудио" if audio_only else "видео"
-        self._log(f"Из браузера ({kind}): {url}")
-        self.status_var.set(f"Ссылка получена · {site_label(url)}")
+        kind = "AAC" if audio_only else "MP4"
+        quality_label = next(
+            (label for code, label in QUALITY_OPTIONS if code == self._quality),
+            self._quality,
+        )
+        self._log(f"Из браузера ({kind}, {quality_label}): {url}")
+        self.status_var.set(f"Ссылка получена · {site_label(url)} · {kind} · {quality_label}")
 
         if not is_supported_url(url):
             messagebox.showwarning(
@@ -1637,18 +1658,18 @@ def main() -> None:
 
     # Second instance: hand off URL(s) to the running app and exit.
     if pending:
-        if all(try_handoff(url, auto, audio) for url, auto, audio in pending):
+        if all(try_handoff(url, auto, audio, quality) for url, auto, audio, quality in pending):
             return
     elif is_bridge_alive() and try_focus():
         # Already running — just bring it forward.
         return
 
     app = YouTubeDownloaderApp()
-    for url, auto, audio in pending:
+    for url, auto, audio, quality in pending:
         app.after(
             300,
-            lambda u=url, a=auto, au=audio: app.receive_external_url(
-                u, auto_start=a, audio_only=au
+            lambda u=url, a=auto, au=audio, q=quality: app.receive_external_url(
+                u, auto_start=a, audio_only=au, quality=q
             ),
         )
     app.mainloop()

@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "TubeSave",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "Скачать видео/Shorts/клипы/музыку в TubeSave — Chrome, Edge, Яндекс.Браузер.",
   "permissions": ["activeTab", "tabs", "scripting", "alarms"],
   "host_permissions": [
@@ -49,7 +49,7 @@
         "*://youtube.com/*",
         "*://m.youtube.com/*"
       ],
-      "js": ["content-youtube.js"],
+      "js": ["picker.js", "content-youtube.js"],
       "run_at": "document_idle"
     },
     {
@@ -61,7 +61,7 @@
         "*://www.vkvideo.ru/*",
         "*://m.vkvideo.ru/*"
       ],
-      "js": ["content-vk.js"],
+      "js": ["picker.js", "content-vk.js"],
       "run_at": "document_idle"
     },
     {
