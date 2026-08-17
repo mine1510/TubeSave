@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "TubeSave",
-  "version": "1.2.3",
+  "version": "1.3.0",
   "description": "Скачать видео/Shorts/клипы/музыку в TubeSave — Chrome, Edge, Яндекс.Браузер.",
   "permissions": ["activeTab", "tabs", "scripting", "alarms"],
   "host_permissions": [
