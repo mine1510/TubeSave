@@ -475,9 +475,12 @@ class Card(tk.Frame):
 
 
 class YouTubeDownloaderApp(tk.Tk):
-    def __init__(self, apply_update_on_start: bool = False) -> None:
+    def __init__(self, apply_update_on_start: bool = False, start_hidden: bool = False) -> None:
         super().__init__()
         self._apply_update_on_start = apply_update_on_start
+        self._start_hidden = start_hidden
+        if start_hidden:
+            self.withdraw()
         self.title(f"TubeSave {APP_VERSION}")
         self.resizable(True, True)
 
@@ -495,6 +498,7 @@ class YouTubeDownloaderApp(tk.Tk):
         self.configure(bg=COLORS["bg"])
         self._events: queue.Queue[tuple[str, object]] = queue.Queue()
         self._is_busy = False
+        self._quiet_download = False
         self._last_external: tuple[str, float] | None = None
         self._started_at: float | None = None
         self._timer_job: str | None = None
@@ -535,6 +539,9 @@ class YouTubeDownloaderApp(tk.Tk):
         self._ensure_tray()
         delay = 800 if getattr(self, "_apply_update_on_start", False) else 2500
         self.after(delay, self._check_updates_silent)
+        if start_hidden:
+            self._ensure_tray()
+            self.withdraw()
 
 
     def _persist_folder(self, folder: str | Path) -> None:
@@ -1319,7 +1326,6 @@ class YouTubeDownloaderApp(tk.Tk):
             for chip in getattr(self, "_quality_chips", []):
                 chip.set_selected(chip.code == self._quality)
 
-        self._bring_to_front()
         self.url_var.set(url)
         kind = "AAC" if audio_only else "MP4"
         quality_label = next(
@@ -1330,10 +1336,9 @@ class YouTubeDownloaderApp(tk.Tk):
         self.status_var.set(f"Ссылка получена · {site_label(url)} · {kind} · {quality_label}")
 
         if not is_supported_url(url):
-            messagebox.showwarning(
-                "Ссылка",
-                "Ссылка получена, но сайт не поддерживается:\n"
-                + SUPPORTED_SITES_HINT,
+            notify_windows(
+                "TubeSave",
+                "Сайт не поддерживается: " + site_label(url),
             )
             return
 
@@ -1342,7 +1347,8 @@ class YouTubeDownloaderApp(tk.Tk):
                 self.status_var.set("Занято — ссылка вставлена, скачивание не запущено")
                 notify_windows("TubeSave", "Ссылка вставлена. Дождитесь конца текущей загрузки.")
                 return
-            self._start_download(audio_only=audio_only)
+            notify_windows("TubeSave", f"Скачивание в фоне · {kind} · {quality_label}")
+            self._start_download(audio_only=audio_only, quiet=True)
 
     def _show_browser_help(self) -> None:
         folder = extension_dir()
@@ -1461,20 +1467,27 @@ class YouTubeDownloaderApp(tk.Tk):
                     self._set_stage("Ошибка")
                     self.status_var.set("Ошибка")
                     self._log(str(message))
-                    messagebox.showerror("Ошибка", message)
+                    if self._quiet_download:
+                        notify_windows("TubeSave — ошибка", str(message))
+                    else:
+                        messagebox.showerror("Ошибка", message)
 
         self.after(80, self._process_events)
 
-    def _validate_inputs(self) -> tuple[str, Path] | None:
+    def _validate_inputs(self, *, quiet: bool = False) -> tuple[str, Path] | None:
         url = self.url_var.get().strip()
         if not url:
-            messagebox.showwarning("Ссылка", "Вставьте ссылку на видео.")
+            if not quiet:
+                messagebox.showwarning("Ссылка", "Вставьте ссылку на видео.")
             return None
         if not is_supported_url(url):
-            messagebox.showwarning(
-                "Ссылка",
-                "Неверная ссылка. Поддерживаются:\n" + SUPPORTED_SITES_HINT,
-            )
+            if quiet:
+                notify_windows("TubeSave", "Неверная ссылка")
+            else:
+                messagebox.showwarning(
+                    "Ссылка",
+                    "Неверная ссылка. Поддерживаются:\n" + SUPPORTED_SITES_HINT,
+                )
             return None
 
         folder = Path(self.folder_var.get().strip())
@@ -1482,7 +1495,10 @@ class YouTubeDownloaderApp(tk.Tk):
             try:
                 folder.mkdir(parents=True, exist_ok=True)
             except OSError as exc:
-                messagebox.showerror("Папка", f"Не удалось создать папку:\n{exc}")
+                if quiet:
+                    notify_windows("TubeSave", f"Не удалось создать папку: {exc}")
+                else:
+                    messagebox.showerror("Папка", f"Не удалось создать папку:\n{exc}")
                 return None
 
         self._persist_folder(folder)
@@ -1530,8 +1546,9 @@ class YouTubeDownloaderApp(tk.Tk):
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _start_download(self, audio_only: bool = False) -> None:
-        validated = self._validate_inputs()
+    def _start_download(self, audio_only: bool = False, *, quiet: bool = False) -> None:
+        self._quiet_download = quiet
+        validated = self._validate_inputs(quiet=quiet)
         if validated is None or self._is_busy:
             return
 
@@ -1672,7 +1689,10 @@ def main() -> None:
     register_protocol()
     register_native_host()
 
-    app = YouTubeDownloaderApp(apply_update_on_start=want_update)
+    app = YouTubeDownloaderApp(
+        apply_update_on_start=want_update,
+        start_hidden=bool(pending) and not want_update,
+    )
     for url, auto, audio, quality in pending:
         app.after(
             400,

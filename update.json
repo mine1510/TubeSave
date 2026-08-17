@@ -1,7 +1,7 @@
 {
-  "app": "1.3.4",
-  "extension": "1.3.4",
-  "notes": "Тестовая сборка автообновления 1.3.4.",
+  "app": "1.3.5",
+  "extension": "1.3.5",
+  "notes": "Скачивание из браузера идёт в фоне, без всплывающего окна TubeSave.",
   "release_page": "https://github.com/mine1510/TubeSave/releases/latest",
   "app_zip": "https://github.com/mine1510/TubeSave/releases/latest/download/TubeSave-Windows.zip",
   "extension_zip": "https://github.com/mine1510/TubeSave/releases/latest/download/TubeSave-Extension.zip"

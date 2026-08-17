@@ -71,20 +71,18 @@ function openViaProtocol(url, autoStart = true, audioOnly = false, quality = "be
     chrome.runtime.getURL("launch.html") +
     "?" +
     new URLSearchParams({ url, auto, audio, quality: q }).toString();
-  chrome.windows.create(
-    { url: page, type: "popup", width: 440, height: 180, focused: true },
-    (win) => {
-      if (chrome.runtime.lastError) {
-        chrome.tabs.create({ url: page, active: true });
-      }
-      const windowId = win && win.id;
-      setTimeout(() => {
-        if (windowId != null) {
-          chrome.windows.remove(windowId).catch(() => {});
-        }
-      }, 8000);
+  chrome.tabs.create({ url: page, active: false }, (tab) => {
+    if (chrome.runtime.lastError) {
+      console.warn(chrome.runtime.lastError.message);
+      return;
     }
-  );
+    const tabId = tab && tab.id;
+    setTimeout(() => {
+      if (tabId != null) {
+        chrome.tabs.remove(tabId).catch(() => {});
+      }
+    }, 4000);
+  });
 }
 
 function sendNative(url, autoStart, audioOnly, quality) {
