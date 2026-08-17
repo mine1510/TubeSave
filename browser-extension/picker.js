@@ -99,6 +99,33 @@
       margin: "0 4px 10px",
     });
     let format = "mp4";
+
+    function startDownload(audioOnly, quality) {
+      const url = getUrl();
+      closeMenu();
+      if (!url) {
+        flash(anchor, "Нет ссылки", "#B00020");
+        return;
+      }
+      if (window.TubeSaveLaunchProtocol) {
+        window.TubeSaveLaunchProtocol(url, audioOnly, quality);
+      }
+      flash(anchor, "Запуск…", "#C45C26");
+      sendDownload(url, audioOnly, quality)
+        .then((response) => {
+          if (response && response.ok) {
+            flash(anchor, audioOnly ? "AAC" : "Отправлено", "#1B7F4B");
+          } else {
+            flash(anchor, "Ошибка", "#B00020");
+            console.warn(response && response.error);
+          }
+        })
+        .catch((err) => {
+          flash(anchor, "Ошибка", "#B00020");
+          console.warn(err);
+        });
+    }
+
     function formatChip(code, label) {
       const chip = document.createElement("button");
       chip.type = "button";
@@ -112,17 +139,16 @@
         fontWeight: "600",
         fontSize: "12px",
         color: "#fff",
-        background: code === format ? "#2F6FED" : "#2A2928",
+        background: code === "aac" ? "#C45C26" : "#2F6FED",
       });
       chip.addEventListener("click", (ev) => {
         ev.preventDefault();
         ev.stopPropagation();
-        format = code;
-        Array.from(formatRow.children).forEach((child) => {
-          child.style.background = child === chip ? "#2F6FED" : "#2A2928";
-        });
-        qualityBlock.style.opacity = format === "aac" ? "0.45" : "1";
-        qualityBlock.style.pointerEvents = format === "aac" ? "none" : "auto";
+        if (code === "aac") {
+          startDownload(true, "best");
+          return;
+        }
+        format = "mp4";
       });
       return chip;
     }
@@ -144,35 +170,17 @@
       const btn = itemStyle(document.createElement("button"));
       btn.type = "button";
       btn.textContent = q.label;
-      btn.addEventListener("click", async (ev) => {
+      btn.addEventListener("click", (ev) => {
         ev.preventDefault();
         ev.stopPropagation();
-        const url = getUrl();
-        const audioOnly = format === "aac";
-        closeMenu();
-        if (window.TubeSaveLaunchProtocol) {
-          window.TubeSaveLaunchProtocol(url, audioOnly, q.code);
-        }
-        flash(anchor, "Запуск…", "#C45C26");
-        try {
-          const response = await sendDownload(url, audioOnly, q.code);
-          if (response && response.ok) {
-            flash(anchor, "Отправлено", "#1B7F4B");
-          } else {
-            flash(anchor, "Ошибка", "#B00020");
-            console.warn(response && response.error);
-          }
-        } catch (err) {
-          flash(anchor, "Ошибка", "#B00020");
-          console.warn(err);
-        }
+        startDownload(format === "aac", q.code);
       });
       qualityBlock.appendChild(btn);
     });
     menu.appendChild(qualityBlock);
 
     const aacHint = document.createElement("div");
-    aacHint.textContent = "AAC — только звук (M4A)";
+    aacHint.textContent = "AAC сразу качает только звук (M4A)";
     Object.assign(aacHint.style, {
       color: "#A8A29E",
       fontSize: "11px",
