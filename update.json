@@ -1,7 +1,7 @@
 {
-  "app": "1.3.9",
-  "extension": "1.3.8",
-  "notes": "Исправление падения _tkinter после автообновления: новый процесс больше не использует чужую папку PyInstaller.",
+  "app": "1.3.10",
+  "extension": "1.3.9",
+  "notes": "Яндекс.Музыка: актуальный API вместо сломанного yt-dlp. Нужен вход в аккаунт в браузере.",
   "release_page": "https://github.com/mine1510/TubeSave/releases/latest",
   "app_zip": "https://github.com/mine1510/TubeSave/releases/latest/download/TubeSave-Windows.zip",
   "extension_zip": "https://github.com/mine1510/TubeSave/releases/latest/download/TubeSave-Extension.zip"

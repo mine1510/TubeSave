@@ -27,7 +27,7 @@ PINNED_EXTENSION_ID = "hmddmgmenbnhoeghphinmmnoeklgbhgg"
 INSTANCE_MUTEX_NAME = "Local\\TubeSave.mine1510.single"
 _INSTANCE_MUTEX_HANDLE = None
 
-UrlHandler = Callable[[str, bool, bool, str], None]
+UrlHandler = Callable[..., None]
 
 
 KNOWN_QUALITIES = {"best", "2160", "1440", "1080", "720", "480", "360"}
@@ -647,12 +647,13 @@ class _BridgeHandler(BaseHTTPRequestHandler):
                 default="music.yandex." in url.lower(),
             )
             quality = _normalize_quality((qs.get("quality") or qs.get("q") or ["best"])[0])
+            cookies = (qs.get("cookies") or [""])[0]
             if not url:
                 self._json(400, {"ok": False, "error": "missing url"})
                 return
             cb = _BRIDGE_CALLBACKS.get("on_url")
             if cb is not None:
-                cb(url, auto, audio, quality)
+                cb(url, auto, audio, quality, cookies)
             self._json(200, {"ok": True, "queued": True})
             return
         self._json(404, {"ok": False, "error": "not found"})
@@ -670,12 +671,13 @@ class _BridgeHandler(BaseHTTPRequestHandler):
             audio_default = "music.yandex." in url.lower()
             audio = _as_bool(data.get("audio_only", data.get("audio")), audio_default)
             quality = _normalize_quality(data.get("quality") or data.get("q") or "best")
+            cookies = str(data.get("cookies") or "")
             if not url:
                 self._json(400, {"ok": False, "error": "missing url"})
                 return
             cb = _BRIDGE_CALLBACKS.get("on_url")
             if cb is not None:
-                cb(url, auto, audio, quality)
+                cb(url, auto, audio, quality, cookies)
             ext_id = str(data.get("extension_id") or "").strip()
             if ext_id:
                 register_native_host([ext_id])

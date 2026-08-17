@@ -30,6 +30,41 @@ function isYandexMusic(url) {
   return /music\.yandex\./i.test(hostOf(url));
 }
 
+async function yandexCookieHeader() {
+  if (!chrome.cookies || !chrome.cookies.getAll) {
+    return "";
+  }
+  try {
+    const groups = await Promise.all([
+      chrome.cookies.getAll({ domain: "yandex.ru" }),
+      chrome.cookies.getAll({ domain: "yandex.net" }),
+      chrome.cookies.getAll({ domain: "music.yandex.ru" }),
+    ]);
+    const wanted = new Set([
+      "Session_id",
+      "sessionid2",
+      "yandexuid",
+      "i",
+      "yp",
+      "ys",
+      "L",
+      "yashr",
+    ]);
+    const seen = new Set();
+    const parts = [];
+    for (const cookie of groups.flat()) {
+      if (!cookie || !wanted.has(cookie.name) || seen.has(cookie.name)) {
+        continue;
+      }
+      seen.add(cookie.name);
+      parts.push(`${cookie.name}=${cookie.value}`);
+    }
+    return parts.join("; ");
+  } catch {
+    return "";
+  }
+}
+
 async function pingBridge() {
   try {
     const res = await fetch(`${BRIDGE}/ping`, { method: "GET", cache: "no-store" });
@@ -42,6 +77,7 @@ async function pingBridge() {
 }
 
 async function sendToApp(url, autoStart = true, audioOnly = false, quality = "best") {
+  const cookies = isYandexMusic(url) ? await yandexCookieHeader() : "";
   const res = await fetch(`${BRIDGE}/download`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -51,6 +87,7 @@ async function sendToApp(url, autoStart = true, audioOnly = false, quality = "be
       audio_only: audioOnly || isYandexMusic(url),
       quality: quality || "best",
       extension_id: chrome.runtime.id,
+      cookies,
     }),
   });
   if (!res.ok) {

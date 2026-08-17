@@ -1281,6 +1281,7 @@ class YouTubeDownloaderApp(tk.Tk):
         auto_start: bool,
         audio_only: bool = False,
         quality: str = "best",
+        cookies: str = "",
     ) -> None:
         # HTTP thread → UI thread
         self.after(
@@ -1290,6 +1291,7 @@ class YouTubeDownloaderApp(tk.Tk):
                 auto_start=auto_start,
                 audio_only=audio_only,
                 quality=quality,
+                cookies=cookies,
             ),
         )
 
@@ -1312,6 +1314,7 @@ class YouTubeDownloaderApp(tk.Tk):
         auto_start: bool = True,
         audio_only: bool = False,
         quality: str | None = None,
+        cookies: str = "",
     ) -> None:
         """Fill the URL field from browser extension / protocol / second instance."""
         url = (url or "").strip()
@@ -1328,6 +1331,7 @@ class YouTubeDownloaderApp(tk.Tk):
         if last and last[0] == stamp and (now - last[1]) < 6:
             return
         self._last_external = (stamp, now)
+        self._pending_cookies = cookies or ""
 
         # Music links always go through audio pipeline.
         if "music.yandex." in url.lower():
@@ -1648,6 +1652,7 @@ class YouTubeDownloaderApp(tk.Tk):
                         status_callback=status_callback,
                         audio_only=audio_only,
                         quality=selected_quality,
+                        cookies=getattr(self, "_pending_cookies", "") or "",
                     )
                 size = format_bytes(filepath.stat().st_size) if filepath.exists() else "—"
                 self._events.put(("size", size))

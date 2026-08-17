@@ -2,12 +2,18 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
+import json
 import re
 import subprocess
 import time
 from pathlib import Path
 from typing import Callable
-from urllib.parse import urlparse
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode, urlparse
+from urllib.request import Request, urlopen
 
 import yt_dlp
 
@@ -78,6 +84,14 @@ SUPPORTED_SITES_HINT = (
     "iwara.tv\n"
     "pornhub.com"
 )
+
+YANDEX_TRACK_RE = re.compile(
+    r"music\.yandex\.(?:ru|com|by|kz|ua)/(?:album/(?P<album>\d+)/)?track/(?P<track>\d+)",
+    re.IGNORECASE,
+)
+YANDEX_API = "https://api.music.yandex.net"
+YANDEX_SIGN_KEY = "p93jhgh689SBReK6ghtw62"
+YANDEX_MD5_SALT = "XGRlBW9FXlekgbPrRHuSiA"
 
 _IMPERSONATE_TARGET = None
 
@@ -432,6 +446,221 @@ def _try_download(
         return _resolve_output_path(ydl, info, audio_only=audio_only)
 
 
+def _safe_filename(text: str) -> str:
+    cleaned = re.sub(r'[<>:"/\\|?*]', "_", str(text or "")).strip(" .")
+    return (cleaned[:180] or "track")
+
+
+def _yandex_headers(page_url: str, cookies: str = "") -> dict[str, str]:
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
+        ),
+        "Accept": "application/json, text/plain, */*",
+        "Origin": "https://music.yandex.ru",
+        "Referer": page_url or "https://music.yandex.ru/",
+        "X-Yandex-Music-Client": "YandexMusicAndroid/24023231",
+    }
+    if cookies:
+        headers["Cookie"] = cookies
+    return headers
+
+
+def _http_read(url: str, headers: dict[str, str], timeout: float = 25.0) -> bytes:
+    req = Request(url, headers=headers)
+    with urlopen(req, timeout=timeout) as resp:
+        return resp.read()
+
+
+def _http_json(url: str, headers: dict[str, str]) -> dict:
+    raw = _http_read(url, headers)
+    data = json.loads(raw.decode("utf-8", errors="replace"))
+    return data if isinstance(data, dict) else {}
+
+
+def _yandex_sign(message: str) -> str:
+    digest = hmac.new(YANDEX_SIGN_KEY.encode(), message.encode(), hashlib.sha256).digest()
+    return base64.b64encode(digest).decode("ascii")[:-1]
+
+
+def parse_yandex_track_id(url: str) -> str | None:
+    match = YANDEX_TRACK_RE.search(url or "")
+    if match:
+        return match.group("track")
+    return None
+
+
+def _yandex_file_info(track_id: str, headers: dict[str, str], quality: str, codecs: str, transport: str) -> dict:
+    ts = int(time.time())
+    message = f"{ts}{track_id}{quality}{codecs}{transport}".replace(",", "")
+    params = {
+        "ts": ts,
+        "trackId": track_id,
+        "quality": quality,
+        "codecs": codecs,
+        "transports": transport,
+        "sign": _yandex_sign(message),
+    }
+    return _http_json(f"{YANDEX_API}/get-file-info?{urlencode(params)}", headers)
+
+
+def _yandex_direct_from_download_info(track_id: str, headers: dict[str, str]) -> tuple[str, bool]:
+    data = _http_json(f"{YANDEX_API}/tracks/{track_id}/download-info", headers)
+    items = data.get("result") or []
+    if not items:
+        raise RuntimeError("Яндекс.Музыка не вернула ссылку на файл.")
+    best = max(items, key=lambda item: int(item.get("bitrateInKbps") or 0))
+    preview = bool(best.get("preview"))
+    info_url = str(best.get("downloadInfoUrl") or "")
+    if not info_url:
+        raise RuntimeError("Яндекс.Музыка не вернула downloadInfoUrl.")
+    sep = "&" if "?" in info_url else "?"
+    payload = _http_read(info_url + sep + "format=json", headers)
+    try:
+        fd = json.loads(payload.decode("utf-8", errors="replace"))
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("Не удалось разобрать ссылку Яндекс.Музыки.") from exc
+    path = str(fd.get("path") or "")
+    sig = str(fd.get("s") or "")
+    host = str(fd.get("host") or "")
+    ts = str(fd.get("ts") or "")
+    if not (path and sig and host and ts):
+        raise RuntimeError("Неполный ответ download-info Яндекс.Музыки.")
+    key = hashlib.md5((YANDEX_MD5_SALT + path[1:] + sig).encode()).hexdigest()
+    return f"https://{host}/get-mp3/{key}/{ts}{path}", preview
+
+
+def _yandex_pick_stream(track_id: str, headers: dict[str, str]) -> tuple[str, str, bool]:
+    preview_fallback: tuple[str, str, bool] | None = None
+    attempts = (
+        ("nq", "mp3", "raw"),
+        ("high", "mp3,aac", "raw"),
+        ("lossless", "mp3,aac,he-aac,flac", "raw"),
+    )
+    for quality, codecs, transport in attempts:
+        try:
+            payload = _yandex_file_info(track_id, headers, quality, codecs, transport)
+            info = (payload.get("result") or {}).get("downloadInfo") or {}
+            urls = info.get("urls") or []
+            if not urls:
+                continue
+            preview = str(info.get("quality") or "").lower() == "preview"
+            ext = "mp3"
+            codec = str(info.get("codec") or "mp3").lower()
+            if "aac" in codec:
+                ext = "m4a"
+            elif "flac" in codec:
+                ext = "flac"
+            if preview:
+                preview_fallback = (str(urls[0]), ext, True)
+                continue
+            return str(urls[0]), ext, False
+        except (HTTPError, URLError, TimeoutError, json.JSONDecodeError, RuntimeError, OSError):
+            continue
+    try:
+        url, preview = _yandex_direct_from_download_info(track_id, headers)
+        if not preview:
+            return url, "mp3", False
+        preview_fallback = (url, "mp3", True)
+    except (HTTPError, URLError, TimeoutError, json.JSONDecodeError, RuntimeError, OSError):
+        pass
+    if preview_fallback:
+        return preview_fallback
+    raise RuntimeError("Не удалось получить файл Яндекс.Музыки.")
+
+
+def _download_binary(
+    url: str,
+    dest: Path,
+    headers: dict[str, str],
+    progress_hook: ProgressCallback | None = None,
+) -> None:
+    req = Request(url, headers=headers)
+    with urlopen(req, timeout=60) as resp, dest.open("wb") as out:
+        total = int(resp.headers.get("Content-Length") or 0)
+        done = 0
+        while True:
+            chunk = resp.read(64 * 1024)
+            if not chunk:
+                break
+            out.write(chunk)
+            done += len(chunk)
+            if progress_hook is not None:
+                progress_hook(
+                    {
+                        "status": "downloading",
+                        "downloaded_bytes": done,
+                        "total_bytes": total or None,
+                    }
+                )
+    if progress_hook is not None:
+        progress_hook({"status": "finished", "filename": str(dest)})
+
+
+def download_yandex_music(
+    url: str,
+    output_dir: Path,
+    progress_hook: ProgressCallback | None = None,
+    status_callback: StatusCallback | None = None,
+    *,
+    cookies: str = "",
+) -> Path:
+    track_id = parse_yandex_track_id(url)
+    if not track_id:
+        raise ValueError("Нужна ссылка на трек Яндекс.Музыки (…/track/123).")
+
+    def report(message: str) -> None:
+        if status_callback is not None:
+            status_callback(message)
+
+    headers = _yandex_headers(url, cookies)
+    report("Подключение к Яндекс.Музыке…")
+    meta = _http_json(f"{YANDEX_API}/tracks/{track_id}", headers)
+    tracks = meta.get("result") or []
+    track = tracks[0] if tracks else {}
+    title = str(track.get("title") or f"track {track_id}")
+    artists = track.get("artists") or []
+    artist = ", ".join(
+        str(item.get("name") or "") for item in artists if isinstance(item, dict) and item.get("name")
+    )
+    display = f"{artist} - {title}" if artist else title
+
+    report(f"Трек: {display}")
+    stream_url, ext, preview = _yandex_pick_stream(track_id, headers)
+    if preview:
+        raise RuntimeError(
+            "Яндекс.Музыка отдала только превью (30 сек).\n"
+            "Откройте music.yandex.ru под своим аккаунтом и нажмите «Скачать» ещё раз."
+        )
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    filename = _safe_filename(f"{display} [{track_id}]") + f".{ext}"
+    dest = output_dir / filename
+    report("Скачивание аудио…")
+    _download_binary(stream_url, dest, headers, progress_hook)
+
+    albums = track.get("albums") or []
+    cover = ""
+    if albums and isinstance(albums[0], dict):
+        cover = str(albums[0].get("coverUri") or track.get("coverUri") or "")
+    else:
+        cover = str(track.get("coverUri") or "")
+    if cover:
+        if not cover.startswith("http"):
+            cover = "https://" + cover.replace("%%", "400x400")
+        else:
+            cover = cover.replace("%%", "400x400")
+        thumb = dest.with_suffix(".jpg")
+        try:
+            report("Встраивание превью…")
+            _download_binary(cover, thumb, headers, None)
+            embed_thumbnail(dest, thumb)
+        except Exception:
+            thumb.unlink(missing_ok=True)
+    return dest
+
+
 def download_video(
     url: str,
     output_dir: Path,
@@ -440,6 +669,7 @@ def download_video(
     *,
     audio_only: bool = False,
     quality: str = "best",
+    cookies: str = "",
 ) -> Path:
     url = url.strip()
     site = detect_site(url)
@@ -449,7 +679,13 @@ def download_video(
         )
     # Yandex Music tracks are audio — always extract M4A/MP3.
     if site == "yandexmusic":
-        audio_only = True
+        return download_yandex_music(
+            url,
+            output_dir,
+            progress_hook,
+            status_callback,
+            cookies=cookies,
+        )
 
     def report(message: str) -> None:
         if status_callback is not None:
