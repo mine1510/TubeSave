@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import json
 import os
+import shutil
 import struct
 import subprocess
 import sys
@@ -48,17 +50,147 @@ def _as_bool(value: object, default: bool = True) -> bool:
     return str(value).lower() not in {"0", "false", "no"}
 
 
+def user_data_dir() -> Path:
+    """Writable app data. Frozen builds must not drop files next to the .exe."""
+    if sys.platform == "win32":
+        base = os.environ.get("LOCALAPPDATA")
+        if base:
+            return Path(base) / "TubeSave"
+        return Path.home() / "AppData" / "Local" / "TubeSave"
+    xdg = os.environ.get("XDG_DATA_HOME")
+    if xdg:
+        return Path(xdg) / "TubeSave"
+    return Path.home() / ".local" / "share" / "TubeSave"
+
+
+def cache_dir() -> Path:
+    return user_data_dir() / "cache"
+
+
+def temp_dir() -> Path:
+    return user_data_dir() / "tmp"
+
+
 def app_root() -> Path:
+    """Directory that contains TubeSave.exe (or the source tree in dev)."""
     if getattr(sys, "frozen", False):
-        beside = Path(sys.executable).resolve().parent
-        # Prefer extension shipped next to the exe (user-installable folder).
-        if (beside / "browser-extension" / "manifest.json").exists():
-            return beside
-        meipass = getattr(sys, "_MEIPASS", None)
-        if meipass and (Path(meipass) / "browser-extension" / "manifest.json").exists():
-            return Path(meipass)
-        return beside
+        return Path(sys.executable).resolve().parent
     return Path(__file__).resolve().parent
+
+
+def runtime_cwd() -> Path:
+    path = user_data_dir() if getattr(sys, "frozen", False) else app_root()
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def bundled_extension_dir() -> Path | None:
+    candidates: list[Path] = []
+    if getattr(sys, "frozen", False):
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            candidates.append(Path(meipass) / "browser-extension")
+        candidates.append(Path(sys.executable).resolve().parent / "browser-extension")
+    else:
+        candidates.append(Path(__file__).resolve().parent / "browser-extension")
+    for path in candidates:
+        if (path / "manifest.json").exists():
+            return path
+    return None
+
+
+def _extension_version(folder: Path) -> tuple[int, ...]:
+    try:
+        data = json.loads((folder / "manifest.json").read_text(encoding="utf-8"))
+        text = str(data.get("version") or "").strip().lstrip("v")
+    except (OSError, json.JSONDecodeError, TypeError):
+        return (0,)
+    parts: list[int] = []
+    for bit in text.split("."):
+        try:
+            parts.append(int(bit))
+        except ValueError:
+            parts.append(0)
+    return tuple(parts) or (0,)
+
+
+def _copy_extension_files(source: Path, dest: Path) -> None:
+    dest.mkdir(parents=True, exist_ok=True)
+    for path in source.rglob("*"):
+        if not path.is_file() or path.name == "extension.pem":
+            continue
+        target = dest / path.relative_to(source)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(path, target)
+
+
+def _sync_bundled_extension() -> None:
+    if not getattr(sys, "frozen", False):
+        return
+    source = bundled_extension_dir()
+    dest = extension_dir()
+    if source is None:
+        return
+    if source.resolve() == dest.resolve():
+        return
+    need_copy = not (dest / "manifest.json").exists()
+    if not need_copy and _extension_version(source) > _extension_version(dest):
+        need_copy = True
+    if need_copy:
+        _copy_extension_files(source, dest)
+
+
+def _migrate_legacy_sidecars() -> None:
+    if not getattr(sys, "frozen", False):
+        return
+    old_root = Path(sys.executable).resolve().parent
+    data = user_data_dir()
+    if old_root.resolve() == data.resolve():
+        return
+    old_ids = old_root / "native-extension-ids.json"
+    new_ids = _extra_ids_path()
+    if old_ids.exists() and not new_ids.exists():
+        new_ids.parent.mkdir(parents=True, exist_ok=True)
+        with contextlib.suppress(OSError):
+            shutil.copy2(old_ids, new_ids)
+
+
+def _cleanup_install_dir_clutter() -> None:
+    """Remove helper files that used to appear next to TubeSave.exe."""
+    if not getattr(sys, "frozen", False):
+        return
+    root = Path(sys.executable).resolve().parent
+    data = user_data_dir()
+    if root.resolve() == data.resolve():
+        return
+    for name in (
+        "tubesave-native-host.bat",
+        "com.tubesave.host.json",
+        "native-extension-ids.json",
+    ):
+        with contextlib.suppress(OSError):
+            (root / name).unlink(missing_ok=True)
+    leftover_ext = root / "browser-extension"
+    dest_ext = extension_dir()
+    if (
+        leftover_ext.is_dir()
+        and leftover_ext.resolve() != dest_ext.resolve()
+        and (dest_ext / "manifest.json").exists()
+    ):
+        shutil.rmtree(leftover_ext, ignore_errors=True)
+
+
+def prepare_user_data() -> Path:
+    data = user_data_dir()
+    cache_dir().mkdir(parents=True, exist_ok=True)
+    temp_dir().mkdir(parents=True, exist_ok=True)
+    _migrate_legacy_sidecars()
+    _sync_bundled_extension()
+    _cleanup_install_dir_clutter()
+    if getattr(sys, "frozen", False):
+        with contextlib.suppress(OSError):
+            os.chdir(data)
+    return data
 
 
 def launch_command_for_protocol() -> str:
@@ -98,16 +230,16 @@ def register_protocol() -> bool:
 
 
 def _native_host_bat_path() -> Path:
-    return app_root() / "tubesave-native-host.bat"
+    return user_data_dir() / "tubesave-native-host.bat"
 
 
 def _native_host_manifest_path() -> Path:
-    return app_root() / f"{NATIVE_HOST_NAME}.json"
+    return user_data_dir() / f"{NATIVE_HOST_NAME}.json"
 
 
 def _write_native_host_launcher() -> Path:
-    root = app_root()
     bat = _native_host_bat_path()
+    bat.parent.mkdir(parents=True, exist_ok=True)
     if getattr(sys, "frozen", False):
         exe = Path(sys.executable).resolve()
         body = (
@@ -126,7 +258,7 @@ def _write_native_host_launcher() -> Path:
 
 
 def _extra_ids_path() -> Path:
-    return app_root() / "native-extension-ids.json"
+    return user_data_dir() / "native-extension-ids.json"
 
 
 def _load_extra_extension_ids() -> list[str]:
@@ -145,7 +277,9 @@ def _save_extra_extension_ids(ids: list[str]) -> None:
     for item in ids:
         if item and item not in unique:
             unique.append(item)
-    _extra_ids_path().write_text(
+    path = _extra_ids_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
         json.dumps(unique, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
@@ -161,6 +295,7 @@ def register_native_host(extra_extension_ids: list[str] | None = None) -> bool:
         return False
 
     try:
+        prepare_user_data()
         saved = _load_extra_extension_ids()
         for ext_id in extra_extension_ids or []:
             ext_id = str(ext_id).strip()
@@ -183,6 +318,7 @@ def register_native_host(extra_extension_ids: list[str] | None = None) -> bool:
             "allowed_origins": origins,
         }
         manifest_path = _native_host_manifest_path()
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
         manifest_path.write_text(
             json.dumps(manifest, ensure_ascii=False, indent=2),
             encoding="utf-8",
@@ -236,7 +372,7 @@ def launch_app_detached(
         extra = []
     if getattr(sys, "frozen", False):
         args = [str(Path(sys.executable).resolve()), *extra]
-        cwd = str(Path(sys.executable).resolve().parent)
+        cwd = str(runtime_cwd())
     else:
         script = (Path(__file__).resolve().parent / "app.py").resolve()
         args = [str(Path(sys.executable).resolve()), str(script), *extra]
@@ -620,4 +756,6 @@ def start_bridge(
 
 
 def extension_dir() -> Path:
-    return app_root() / "browser-extension"
+    if getattr(sys, "frozen", False):
+        return user_data_dir() / "browser-extension"
+    return Path(__file__).resolve().parent / "browser-extension"

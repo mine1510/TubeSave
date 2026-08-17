@@ -143,7 +143,7 @@ def get_impersonate_target():
         ImpersonateTarget("edge", "101", "windows", "10"),
         ImpersonateTarget("chrome", "99", "windows", "10"),
     ]
-    probe = yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True})
+    probe = yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True, **_ydl_storage_opts()})
     available = [target for target, _source in probe._get_available_impersonate_targets()]
     for target in preferred:
         if any(target in item or item in target for item in available):
@@ -270,6 +270,19 @@ def fallback_format_selector(
     return f"best[height<=?{height}][ext=mp4]/best[ext=mp4]/best"
 
 
+def _ydl_storage_opts() -> dict:
+    from bridge import cache_dir, temp_dir
+
+    cache = cache_dir()
+    tmp = temp_dir()
+    cache.mkdir(parents=True, exist_ok=True)
+    tmp.mkdir(parents=True, exist_ok=True)
+    return {
+        "cachedir": str(cache),
+        "paths": {"temp": str(tmp)},
+    }
+
+
 def build_ydl_opts(
     output_dir: Path,
     progress_hook: ProgressCallback | None = None,
@@ -282,6 +295,7 @@ def build_ydl_opts(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     opts: dict = {
+        **_ydl_storage_opts(),
         "outtmpl": str(output_dir / "%(title)s [%(id)s].%(ext)s"),
         "ffmpeg_location": get_ffmpeg_location(),
         "writethumbnail": True,
@@ -358,6 +372,7 @@ def fetch_video_info(url: str) -> dict:
             "Неподдерживаемая ссылка. Доступны:\n" + SUPPORTED_SITES_HINT
         )
     opts = {
+        **_ydl_storage_opts(),
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,

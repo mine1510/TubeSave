@@ -1,4 +1,5 @@
 # -*- mode: python ; coding: utf-8 -*-
+from pathlib import Path
 from PyInstaller.utils.hooks import collect_all
 
 datas = []
@@ -23,6 +24,12 @@ tmp_ret = collect_all('pystray')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 tmp_ret = collect_all('PIL')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+
+ext_dir = Path('browser-extension')
+if ext_dir.is_dir():
+    for file in ext_dir.rglob('*'):
+        if file.is_file() and file.name != 'extension.pem':
+            datas.append((str(file), str(Path('browser-extension') / file.relative_to(ext_dir).parent)))
 
 
 a = Analysis(

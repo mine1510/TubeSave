@@ -15,7 +15,7 @@ from typing import Callable
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-from bridge import app_root, extension_dir
+from bridge import app_root, extension_dir, user_data_dir
 from version import (
     APP_VERSION,
     APP_ZIP_NAME,
@@ -299,9 +299,22 @@ def install_app_update(
         "  goto copy_exe",
         ")",
     ]
+    data_dir = user_data_dir()
+    dest_ext = extension_dir()
+    data_dir.mkdir(parents=True, exist_ok=True)
+    dest_ext.mkdir(parents=True, exist_ok=True)
     if new_ext.exists():
         lines.append(
-            f'xcopy /E /I /Y "{q(new_ext)}" "{q(target_dir / "browser-extension")}\\" >nul'
+            f'xcopy /E /I /Y "{q(new_ext)}" "{q(dest_ext)}\\" >nul'
+        )
+    if target_dir.resolve() != data_dir.resolve():
+        lines.extend(
+            [
+                f'del /Q "{q(target_dir / "tubesave-native-host.bat")}" >nul 2>&1',
+                f'del /Q "{q(target_dir / "com.tubesave.host.json")}" >nul 2>&1',
+                f'del /Q "{q(target_dir / "native-extension-ids.json")}" >nul 2>&1',
+                f'if exist "{q(target_dir / "browser-extension")}" rmdir /S /Q "{q(target_dir / "browser-extension")}" >nul 2>&1',
+            ]
         )
     lines.extend(
         [
@@ -312,8 +325,8 @@ def install_app_update(
             "set TCL_LIBRARY=",
             "set TK_LIBRARY=",
             "set TCLLIBPATH=",
-            f'cd /d "{q(target_dir)}"',
-            f'start "" /D "{q(target_dir)}" "{q(target_exe)}"',
+            f'cd /d "{q(data_dir)}"',
+            f'start "" /D "{q(data_dir)}" "{q(target_exe)}"',
             f'rmdir /S /Q "{q(staging)}" >nul 2>&1',
             "endlocal",
             "exit /b 0",

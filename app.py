@@ -29,9 +29,11 @@ from bridge import (
     extension_dir,
     is_bridge_alive,
     is_update_launch,
+    prepare_user_data,
     register_native_host,
     register_protocol,
     run_native_host,
+    runtime_cwd,
     start_bridge,
     try_apply_updates,
     try_handoff,
@@ -1183,6 +1185,7 @@ class YouTubeDownloaderApp(tk.Tk):
         # Prefer packaged extension icon when available.
         for candidate in (
             extension_dir() / "icons" / "icon128.png",
+            Path(getattr(sys, "_MEIPASS", "")) / "browser-extension" / "icons" / "icon128.png",
             Path(__file__).resolve().parent / "browser-extension" / "icons" / "icon128.png",
         ):
             if candidate.exists():
@@ -1697,7 +1700,7 @@ def _relaunch_without_stale_extract() -> bool:
         flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
     subprocess.Popen(
         [sys.executable, *sys.argv[1:]],
-        cwd=str(Path(sys.executable).resolve().parent),
+        cwd=str(runtime_cwd()),
         env=env,
         close_fds=True,
         creationflags=flags,
@@ -1714,6 +1717,7 @@ def main() -> None:
         return
     if _relaunch_without_stale_extract():
         return
+    prepare_user_data()
 
     pending = collect_launch_urls()
     want_update = any(is_update_launch(arg) for arg in sys.argv[1:])
