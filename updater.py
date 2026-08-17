@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -274,11 +275,21 @@ def install_app_update(
     def q(path: Path) -> str:
         return str(path).replace('"', "")
 
+    old_pid = os.getpid()
     lines = [
         "@echo off",
         "setlocal",
         "set n=0",
+        f"set OLD_PID={old_pid}",
         "timeout /t 2 /nobreak >nul",
+        ":wait_old",
+        'tasklist /FI "PID eq %OLD_PID%" | find "%OLD_PID%" >nul',
+        "if not errorlevel 1 (",
+        "  timeout /t 1 /nobreak >nul",
+        "  set /a n+=1",
+        "  if %n% lss 30 goto wait_old",
+        ")",
+        "set n=0",
         ":copy_exe",
         f'copy /Y "{q(new_exe)}" "{q(target_exe)}" >nul',
         "if errorlevel 1 (",
@@ -294,7 +305,15 @@ def install_app_update(
         )
     lines.extend(
         [
-            f'start "" "{q(target_exe)}"',
+            "set _MEIPASS=",
+            "set _MEI=",
+            "set PYTHONHOME=",
+            "set PYTHONPATH=",
+            "set TCL_LIBRARY=",
+            "set TK_LIBRARY=",
+            "set TCLLIBPATH=",
+            f'cd /d "{q(target_dir)}"',
+            f'start "" /D "{q(target_dir)}" "{q(target_exe)}"',
             f'rmdir /S /Q "{q(staging)}" >nul 2>&1',
             "endlocal",
             "exit /b 0",
@@ -310,12 +329,22 @@ def install_app_update(
 
     flags = 0
     if hasattr(subprocess, "CREATE_NO_WINDOW"):
-        flags = subprocess.CREATE_NO_WINDOW
+        flags = subprocess.CREATE_NO_WINDOW | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    clean_env = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith("_MEI")
+        and key not in {"PYTHONHOME", "PYTHONPATH", "TCL_LIBRARY", "TK_LIBRARY", "TCLLIBPATH"}
+    }
     subprocess.Popen(
         ["cmd.exe", "/c", str(bat)],
         creationflags=flags,
-        cwd=str(staging),
+        cwd=str(target_dir),
+        env=clean_env,
         close_fds=True,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
     )
 
 

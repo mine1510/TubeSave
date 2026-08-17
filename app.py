@@ -7,6 +7,7 @@ import io
 import json
 import os
 import queue
+import subprocess
 import sys
 import threading
 import time
@@ -1203,7 +1204,9 @@ class YouTubeDownloaderApp(tk.Tk):
             return
         try:
             import pystray
-        except ImportError:
+            icon_image = self._tray_icon_image()
+        except Exception:
+            self._tray = None
             return
 
         menu = pystray.Menu(
@@ -1212,14 +1215,17 @@ class YouTubeDownloaderApp(tk.Tk):
         )
         self._tray = pystray.Icon(
             "TubeSave",
-            self._tray_icon_image(),
+            icon_image,
             "TubeSave",
             menu,
         )
 
         def run_tray() -> None:
             assert self._tray is not None
-            self._tray.run()
+            try:
+                self._tray.run()
+            except Exception:
+                return
 
         self._tray_thread = threading.Thread(target=run_tray, name="TubeSaveTray", daemon=True)
         self._tray_thread.start()
@@ -1666,9 +1672,47 @@ def _handoff_to_running(pending: list[tuple[str, bool, bool, str]], timeout: flo
     return is_bridge_alive() and try_focus()
 
 
+def _relaunch_without_stale_extract() -> bool:
+    """Restart this frozen exe if it inherited a dying PyInstaller unpack folder."""
+    if os.environ.get("TUBESAVE_CLEAN_START") == "1":
+        return False
+    if not getattr(sys, "frozen", False):
+        return False
+    mei = getattr(sys, "_MEIPASS", "") or os.environ.get("_MEIPASS", "")
+    if not mei:
+        return False
+    root = Path(mei)
+    imaging = list(root.glob("PIL/_imaging*.pyd")) + list(root.glob("_imaging*.pyd"))
+    if any(path.exists() and path.stat().st_size > 0 for path in imaging):
+        return False
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith("_MEI")
+        and key not in {"PYTHONHOME", "PYTHONPATH", "TCL_LIBRARY", "TK_LIBRARY", "TCLLIBPATH"}
+    }
+    env["TUBESAVE_CLEAN_START"] = "1"
+    flags = 0
+    if sys.platform == "win32":
+        flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+    subprocess.Popen(
+        [sys.executable, *sys.argv[1:]],
+        cwd=str(Path(sys.executable).resolve().parent),
+        env=env,
+        close_fds=True,
+        creationflags=flags,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    return True
+
+
 def main() -> None:
     if "--native-messaging" in sys.argv:
         run_native_host()
+        return
+    if _relaunch_without_stale_extract():
         return
 
     pending = collect_launch_urls()
