@@ -18,31 +18,38 @@
     return href;
   }
 
+  function applyBase(el) {
+    el.style.setProperty("all", "unset", "important");
+    el.style.setProperty("box-sizing", "border-box", "important");
+    el.style.setProperty("display", "inline-flex", "important");
+    el.style.setProperty("align-items", "center", "important");
+    el.style.setProperty("justify-content", "center", "important");
+    el.style.setProperty("cursor", "pointer", "important");
+    el.style.setProperty("font-family", "Roboto, Arial, sans-serif", "important");
+    el.style.setProperty("font-weight", "600", "important");
+    el.style.setProperty("color", "#fff", "important");
+    el.style.setProperty("background", "#2F6FED", "important");
+    el.style.setProperty("border", "none", "important");
+    el.style.setProperty("white-space", "nowrap", "important");
+    el.style.setProperty("user-select", "none", "important");
+    el.style.setProperty("pointer-events", "auto", "important");
+    el.style.setProperty("visibility", "visible", "important");
+    el.style.setProperty("opacity", "1", "important");
+  }
+
   function styleInline(btn, label) {
     btn.id = BTN_ID;
     btn.type = "button";
     btn.textContent = label;
     btn.title = "Скачать видео: выбрать качество и формат";
     btn.setAttribute("aria-label", "Скачать видео");
-    Object.assign(btn.style, {
-      display: "inline-flex",
-      alignItems: "center",
-      justifyContent: "center",
-      height: "36px",
-      padding: "0 14px",
-      marginLeft: "8px",
-      border: "none",
-      borderRadius: "18px",
-      cursor: "pointer",
-      fontFamily: "Roboto, Arial, sans-serif",
-      fontSize: "14px",
-      fontWeight: "500",
-      color: "#fff",
-      background: "#2F6FED",
-      whiteSpace: "nowrap",
-      userSelect: "none",
-      zIndex: "9999",
-    });
+    applyBase(btn);
+    btn.style.setProperty("height", "36px", "important");
+    btn.style.setProperty("padding", "0 14px", "important");
+    btn.style.setProperty("margin-left", "8px", "important");
+    btn.style.setProperty("border-radius", "18px", "important");
+    btn.style.setProperty("font-size", "14px", "important");
+    btn.style.setProperty("z-index", "9999", "important");
   }
 
   function styleFloat(btn, label) {
@@ -50,24 +57,20 @@
     btn.type = "button";
     btn.textContent = label;
     btn.title = "Скачать Shorts: выбрать качество и формат";
-    Object.assign(btn.style, {
-      position: "fixed",
-      right: "18px",
-      bottom: "96px",
-      zIndex: "2147483646",
-      height: "44px",
-      padding: "0 16px",
-      border: "none",
-      borderRadius: "22px",
-      cursor: "pointer",
-      fontFamily: "Roboto, Arial, sans-serif",
-      fontSize: "14px",
-      fontWeight: "600",
-      color: "#fff",
-      background: "#2F6FED",
-      boxShadow: "0 8px 24px rgba(0,0,0,.28)",
-      userSelect: "none",
-    });
+    btn.setAttribute("aria-label", "Скачать Shorts");
+    applyBase(btn);
+    btn.style.setProperty("position", "fixed", "important");
+    btn.style.setProperty("top", "72px", "important");
+    btn.style.setProperty("right", "16px", "important");
+    btn.style.setProperty("bottom", "auto", "important");
+    btn.style.setProperty("left", "auto", "important");
+    btn.style.setProperty("z-index", "2147483646", "important");
+    btn.style.setProperty("height", "44px", "important");
+    btn.style.setProperty("min-width", "132px", "important");
+    btn.style.setProperty("padding", "0 16px", "important");
+    btn.style.setProperty("border-radius", "22px", "important");
+    btn.style.setProperty("font-size", "14px", "important");
+    btn.style.setProperty("box-shadow", "0 8px 24px rgba(0,0,0,.35)", "important");
   }
 
   function attachPicker(btn) {
@@ -76,16 +79,7 @@
     }
   }
 
-  function findActionsRow() {
-    if (isShortsPage()) {
-      return (
-        document.querySelector("ytd-reel-player-overlay-renderer #actions") ||
-        document.querySelector("#actions.ytd-reel-player-overlay-renderer") ||
-        document.querySelector("ytd-shorts #actions") ||
-        document.querySelector("#like-button")?.parentElement ||
-        null
-      );
-    }
+  function findWatchActionsRow() {
     return (
       document.querySelector("ytd-watch-metadata #actions") ||
       document.querySelector("#actions-inner") ||
@@ -94,46 +88,46 @@
     );
   }
 
-  function ensureInlineButton() {
+  function ensureWatchButton() {
     if (document.getElementById(BTN_ID)) {
-      return true;
-    }
-    const host = findActionsRow();
-    if (!host) {
-      return false;
-    }
-    const btn = document.createElement("button");
-    styleInline(btn, isShortsPage() ? "Скачать Shorts" : "Скачать видео");
-    attachPicker(btn);
-    host.appendChild(btn);
-    return true;
-  }
-
-  function ensureFloatButton() {
-    if (!isShortsPage()) {
-      const old = document.getElementById(FLOAT_ID);
-      if (old) old.remove();
       return;
     }
+    const host = findWatchActionsRow();
+    if (!host) {
+      return;
+    }
+    const btn = document.createElement("button");
+    styleInline(btn, "Скачать видео");
+    attachPicker(btn);
+    host.appendChild(btn);
+  }
+
+  function ensureShortsFloat() {
     if (document.getElementById(FLOAT_ID)) {
       return;
     }
     const btn = document.createElement("button");
-    styleFloat(btn, "↓ Shorts");
+    styleFloat(btn, "Скачать Shorts");
     attachPicker(btn);
-    document.documentElement.appendChild(btn);
+    (document.body || document.documentElement).appendChild(btn);
+  }
+
+  function clearShortsFloat() {
+    document.getElementById(FLOAT_ID)?.remove();
+  }
+
+  function clearWatchButton() {
+    document.getElementById(BTN_ID)?.remove();
   }
 
   function ensureButton() {
-    const placed = ensureInlineButton();
-    if (!placed && isShortsPage()) {
-      ensureFloatButton();
-    } else if (placed) {
-      const old = document.getElementById(FLOAT_ID);
-      if (old) old.remove();
-    } else {
-      ensureFloatButton();
+    if (isShortsPage()) {
+      clearWatchButton();
+      ensureShortsFloat();
+      return;
     }
+    clearShortsFloat();
+    ensureWatchButton();
   }
 
   ensureButton();
@@ -144,10 +138,8 @@
   setInterval(() => {
     if (location.href !== lastHref) {
       lastHref = location.href;
-      document.getElementById(BTN_ID)?.remove();
-      document.getElementById(FLOAT_ID)?.remove();
       if (window.TubeSavePicker) window.TubeSavePicker.closeMenu();
-      ensureButton();
     }
-  }, 700);
+    ensureButton();
+  }, 500);
 })();

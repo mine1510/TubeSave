@@ -35,7 +35,6 @@ from updater import (
     fetch_update_info,
     install_app_update,
     install_extension_update,
-    open_releases_page,
 )
 from version import APP_VERSION, EXTENSION_VERSION
 
@@ -599,17 +598,6 @@ class YouTubeDownloaderApp(tk.Tk):
         )
         browser_btn.pack(side="right", padx=(0, 10))
 
-        hide_btn = self._register_pill(
-            PillButton(actions, "В трей", self._minimize_to_tray, width=100)
-        )
-        hide_btn.pack(side="right", padx=(0, 10))
-
-        update_btn = self._register_pill(
-            PillButton(actions, "Обновить", self._check_updates_manual, width=110)
-        )
-        update_btn.pack(side="right", padx=(0, 10))
-        self.update_btn = update_btn
-
         # Scrollable-feeling content above buttons
         content = tk.Frame(root, bg=COLORS["bg"])
         content.pack(side="top", fill="both", expand=True)
@@ -1096,77 +1084,33 @@ class YouTubeDownloaderApp(tk.Tk):
         return {"ok": True, "queued": True}
 
     def _check_updates_silent(self) -> None:
+        self.after(6 * 60 * 60 * 1000, self._check_updates_silent)
+
         def worker() -> None:
             try:
                 info = fetch_update_info()
                 self._update_info = info
                 if info.app_update_available or info.extension_update_available:
-                    parts = []
-                    if info.app_update_available:
-                        parts.append(f"приложение {APP_VERSION} → {info.app_version}")
-                    if info.extension_update_available:
-                        parts.append(
-                            f"плагин {EXTENSION_VERSION} → {info.extension_version}"
-                        )
-                    msg = "Доступно обновление: " + ", ".join(parts)
-                    self.after(0, lambda: self._notify_update_available(msg, info))
+                    self.after(0, lambda: self._auto_apply_update(info))
             except Exception:
                 pass
 
         threading.Thread(target=worker, daemon=True, name="TubeSaveUpdateCheck").start()
 
-    def _notify_update_available(self, message: str, info) -> None:
-        self.status_var.set(message)
-        self._log(message)
-        notify_windows("TubeSave — обновление", message)
-        if messagebox.askyesno(
-            "Обновление TubeSave",
-            f"{message}\n\nУстановить сейчас?\n\n{info.notes[:240]}".strip(),
-        ):
-            self._apply_updates(info)
-
-    def _check_updates_manual(self) -> None:
+    def _auto_apply_update(self, info) -> None:
         if self._is_busy:
-            messagebox.showinfo("Обновление", "Дождитесь окончания скачивания.")
-            return
-        self.status_var.set("Проверка обновлений…")
-
-        def worker() -> None:
-            try:
-                info = fetch_update_info()
-                self._update_info = info
-                self.after(0, lambda: self._handle_manual_update_result(info))
-            except Exception as exc:
-                self.after(
-                    0,
-                    lambda: messagebox.showerror(
-                        "Обновление",
-                        f"Не удалось проверить обновления:\n{exc}",
-                    ),
-                )
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    def _handle_manual_update_result(self, info) -> None:
-        if not info.app_update_available and not info.extension_update_available:
-            messagebox.showinfo(
-                "Обновление",
-                f"У вас актуальная версия.\nПриложение: {APP_VERSION}\nПлагин: {EXTENSION_VERSION}",
-            )
-            self.status_var.set("Обновлений нет")
+            self.after(5 * 60 * 1000, lambda: self._auto_apply_update(info))
             return
         parts = []
         if info.app_update_available:
-            parts.append(f"Приложение: {APP_VERSION} → {info.app_version}")
+            parts.append(f"приложение {APP_VERSION} → {info.app_version}")
         if info.extension_update_available:
-            parts.append(f"Плагин: {EXTENSION_VERSION} → {info.extension_version}")
-        text = "\n".join(parts)
-        if info.notes:
-            text += f"\n\n{info.notes[:300]}"
-        if messagebox.askyesno("Обновление TubeSave", f"{text}\n\nУстановить?"):
-            self._apply_updates(info)
-        else:
-            open_releases_page()
+            parts.append(f"плагин {EXTENSION_VERSION} → {info.extension_version}")
+        msg = "Автообновление: " + ", ".join(parts)
+        self.status_var.set(msg)
+        self._log(msg)
+        notify_windows("TubeSave — обновление", msg)
+        self._apply_updates(info)
 
     def _apply_updates(self, info) -> None:
         def worker() -> None:
@@ -1185,11 +1129,9 @@ class YouTubeDownloaderApp(tk.Tk):
                     return
                 self.after(
                     0,
-                    lambda: messagebox.showinfo(
-                        "Обновление",
-                        "Плагин обновлён на диске.\n"
-                        "В браузере нажмите «Обновить» на странице расширений\n"
-                        "или дождитесь автоперезагрузки плагина.",
+                    lambda: notify_windows(
+                        "TubeSave",
+                        "Плагин обновлён. Если кнопки в браузере не обновились — перезагрузите расширение.",
                     ),
                 )
                 self.after(0, lambda: self.status_var.set("Плагин обновлён"))
