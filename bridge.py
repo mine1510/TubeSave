@@ -19,6 +19,8 @@ from urllib.error import URLError
 from urllib.parse import parse_qs, quote, unquote, urlparse
 from urllib.request import Request, urlopen
 
+from boot_clean import frozen_restart_env, windows_detach_flags
+
 BRIDGE_HOST = "127.0.0.1"
 BRIDGE_PORT = 17834
 BRIDGE_BASE = f"http://{BRIDGE_HOST}:{BRIDGE_PORT}"
@@ -377,12 +379,11 @@ def launch_app_detached(
         script = (Path(__file__).resolve().parent / "app.py").resolve()
         args = [str(Path(sys.executable).resolve()), str(script), *extra]
         cwd = str(script.parent)
-    flags = 0
-    if sys.platform == "win32":
-        flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+    flags = windows_detach_flags()
     subprocess.Popen(
         args,
         cwd=cwd,
+        env=frozen_restart_env(),
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,

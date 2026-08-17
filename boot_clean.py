@@ -11,6 +11,25 @@ import subprocess
 import sys
 from pathlib import Path
 
+CREATE_BREAKAWAY_FROM_JOB = 0x01000000
+
+
+def windows_detach_flags(*, hide_window: bool = False) -> int:
+    """Flags so a child outlives this frozen process.
+
+    ``hide_window=True`` is for helper cmd/powershell. Direct GUI relaunch
+    uses a detached process instead — combining both flags can fail on Windows.
+    """
+    if sys.platform != "win32":
+        return 0
+    flags = subprocess.CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB
+    if hide_window:
+        flags |= getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    else:
+        flags |= subprocess.DETACHED_PROCESS
+    return flags
+
+
 _STRIP_ENV = {
     "PYTHONHOME",
     "PYTHONPATH",
@@ -18,6 +37,25 @@ _STRIP_ENV = {
     "TK_LIBRARY",
     "TCLLIBPATH",
 }
+
+
+def frozen_restart_env(extra: dict[str, str] | None = None) -> dict[str, str]:
+    """Environment for a new top-level TubeSave.exe that must outlive this process.
+
+    PyInstaller 6.9+ treats a spawn of the same exe as a worker that reuses the
+    parent's extract. After an update the parent is cmd.exe / a replaced binary,
+    which then fails with: "Security validation failure: parent process has
+    different executable!".
+    """
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith(("_MEI", "_PYI")) and key not in _STRIP_ENV
+    }
+    env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+    if extra:
+        env.update(extra)
+    return env
 
 
 def _mei_root() -> Path | None:
@@ -56,16 +94,6 @@ def extract_is_broken() -> bool:
     return False
 
 
-def _clean_env() -> dict[str, str]:
-    env = {
-        key: value
-        for key, value in os.environ.items()
-        if not key.startswith("_MEI") and key not in _STRIP_ENV
-    }
-    env["TUBESAVE_CLEAN_START"] = "1"
-    return env
-
-
 def _runtime_cwd() -> Path:
     base = os.environ.get("LOCALAPPDATA")
     path = Path(base) / "TubeSave" if base else Path.home() / "AppData" / "Local" / "TubeSave"
@@ -77,17 +105,11 @@ def ensure_fresh_extract() -> bool:
     """Restart this exe with a clean env. True if this process should exit."""
     if not extract_is_broken():
         return False
-    flags = 0
-    if sys.platform == "win32":
-        flags = (
-            subprocess.DETACHED_PROCESS
-            | subprocess.CREATE_NEW_PROCESS_GROUP
-            | 0x01000000  # CREATE_BREAKAWAY_FROM_JOB
-        )
+    flags = windows_detach_flags()
     subprocess.Popen(
         [sys.executable, *sys.argv[1:]],
         cwd=str(_runtime_cwd()),
-        env=_clean_env(),
+        env=frozen_restart_env({"TUBESAVE_CLEAN_START": "1"}),
         close_fds=True,
         creationflags=flags,
         stdin=subprocess.DEVNULL,

@@ -10,6 +10,7 @@ import re
 import subprocess
 import time
 from pathlib import Path
+from threading import Event
 from typing import Callable
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlparse
@@ -20,6 +21,54 @@ import yt_dlp
 
 ProgressCallback = Callable[[dict], None]
 StatusCallback = Callable[[str], None]
+
+
+class DownloadCancelled(Exception):
+    """Raised when the user stops an in-progress download."""
+
+
+def _is_cancelled(cancel_event: Event | None) -> bool:
+    return cancel_event is not None and cancel_event.is_set()
+
+
+def _check_cancel(cancel_event: Event | None) -> None:
+    if _is_cancelled(cancel_event):
+        raise DownloadCancelled("Загрузка отменена")
+
+
+def _interruptible_sleep(seconds: float, cancel_event: Event | None) -> None:
+    deadline = time.monotonic() + max(0.0, seconds)
+    while True:
+        _check_cancel(cancel_event)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        time.sleep(min(0.15, remaining))
+
+
+def _delete_partial_files(data: dict) -> None:
+    names: list[str] = []
+    for key in ("tmpfilename", "filename"):
+        raw = data.get(key)
+        if raw:
+            names.append(str(raw))
+    for name in names:
+        path = Path(name)
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        try:
+            Path(str(name) + ".part").unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _abort_if_cancelled(data: dict, cancel_event: Event | None) -> None:
+    if not _is_cancelled(cancel_event):
+        return
+    _delete_partial_files(data)
+    raise DownloadCancelled("Загрузка отменена")
 
 
 SITE_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
@@ -182,12 +231,17 @@ def _find_sidecar_thumbnail(video_path: Path) -> Path | None:
     return matches[0] if matches else None
 
 
-def embed_thumbnail(video_path: Path, thumb_path: Path | None = None) -> Path:
+def embed_thumbnail(
+    video_path: Path,
+    thumb_path: Path | None = None,
+    cancel_event: Event | None = None,
+) -> Path:
     """Embed cover art so players/Explorer can show a preview."""
     thumb = thumb_path or _find_sidecar_thumbnail(video_path)
     if thumb is None or not video_path.exists():
         return video_path
 
+    _check_cancel(cancel_event)
     ffmpeg = get_ffmpeg_location()
     temp_out = video_path.with_name(video_path.stem + ".thumb.tmp" + video_path.suffix)
     cmd = [
@@ -209,8 +263,25 @@ def embed_thumbnail(video_path: Path, thumb_path: Path | None = None) -> Path:
         "attached_pic",
         str(temp_out),
     ]
-    result = subprocess.run(cmd, capture_output=True)
-    if result.returncode == 0 and temp_out.exists() and temp_out.stat().st_size > 0:
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    while True:
+        try:
+            proc.wait(timeout=0.25)
+            break
+        except subprocess.TimeoutExpired:
+            if _is_cancelled(cancel_event):
+                proc.kill()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
+                temp_out.unlink(missing_ok=True)
+                raise DownloadCancelled("Загрузка отменена") from None
+    if proc.returncode == 0 and temp_out.exists() and temp_out.stat().st_size > 0:
         video_path.unlink(missing_ok=True)
         temp_out.rename(video_path)
     else:
@@ -305,6 +376,7 @@ def build_ydl_opts(
     audio_only: bool = False,
     quality: str = "best",
     site: str | None = None,
+    cancel_event: Event | None = None,
 ) -> dict:
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -350,12 +422,21 @@ def build_ydl_opts(
     if impersonate is not None:
         opts["impersonate"] = impersonate
 
+    progress_hooks: list[ProgressCallback] = []
+    if cancel_event is not None:
+        progress_hooks.append(lambda data: _abort_if_cancelled(data, cancel_event))
     if progress_hook is not None:
-        opts["progress_hooks"] = [progress_hook]
+        progress_hooks.append(progress_hook)
+    if progress_hooks:
+        opts["progress_hooks"] = progress_hooks
 
+    postprocessor_hooks: list[ProgressCallback] = []
+    if cancel_event is not None:
+        postprocessor_hooks.append(lambda data: _abort_if_cancelled(data, cancel_event))
     if status_callback is not None:
 
         def postprocessor_hook(data: dict) -> None:
+            _abort_if_cancelled(data, cancel_event)
             status = data.get("status")
             postprocessor = data.get("postprocessor") or ""
             if status == "started":
@@ -374,17 +455,20 @@ def build_ydl_opts(
             elif status == "finished" and postprocessor == "Merger":
                 status_callback("Объединение завершено")
 
-        opts["postprocessor_hooks"] = [postprocessor_hook]
+        postprocessor_hooks.append(postprocessor_hook)
+    if postprocessor_hooks:
+        opts["postprocessor_hooks"] = postprocessor_hooks
 
     return opts
 
 
-def fetch_video_info(url: str) -> dict:
+def fetch_video_info(url: str, cancel_event: Event | None = None) -> dict:
     url = url.strip()
     if detect_site(url) is None:
         raise ValueError(
             "Неподдерживаемая ссылка. Доступны:\n" + SUPPORTED_SITES_HINT
         )
+    _check_cancel(cancel_event)
     opts = {
         **_ydl_storage_opts(),
         "quiet": True,
@@ -395,8 +479,14 @@ def fetch_video_info(url: str) -> dict:
     impersonate = get_impersonate_target()
     if impersonate is not None:
         opts["impersonate"] = impersonate
+    if cancel_event is not None:
+        opts["progress_hooks"] = [lambda data: _abort_if_cancelled(data, cancel_event)]
     with yt_dlp.YoutubeDL(opts) as ydl:
-        return ydl.extract_info(url, download=False)
+        info = ydl.extract_info(url, download=False)
+    _check_cancel(cancel_event)
+    if info is None:
+        raise RuntimeError("Не удалось получить информацию о видео.")
+    return info
 
 
 def _resolve_output_path(
@@ -436,11 +526,14 @@ def _try_download(
     report: Callable[[str], None] | None = None,
     *,
     audio_only: bool = False,
+    cancel_event: Event | None = None,
 ) -> Path:
+    _check_cancel(cancel_event)
     if report is not None:
         report("Получение информации о видео…")
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=True)
+        _check_cancel(cancel_event)
         if info is None:
             raise RuntimeError("Не удалось получить информацию о видео.")
         return _resolve_output_path(ydl, info, audio_only=audio_only)
@@ -575,25 +668,32 @@ def _download_binary(
     dest: Path,
     headers: dict[str, str],
     progress_hook: ProgressCallback | None = None,
+    cancel_event: Event | None = None,
 ) -> None:
+    _check_cancel(cancel_event)
     req = Request(url, headers=headers)
-    with urlopen(req, timeout=60) as resp, dest.open("wb") as out:
-        total = int(resp.headers.get("Content-Length") or 0)
-        done = 0
-        while True:
-            chunk = resp.read(64 * 1024)
-            if not chunk:
-                break
-            out.write(chunk)
-            done += len(chunk)
-            if progress_hook is not None:
-                progress_hook(
-                    {
-                        "status": "downloading",
-                        "downloaded_bytes": done,
-                        "total_bytes": total or None,
-                    }
-                )
+    try:
+        with urlopen(req, timeout=60) as resp, dest.open("wb") as out:
+            total = int(resp.headers.get("Content-Length") or 0)
+            done = 0
+            while True:
+                _check_cancel(cancel_event)
+                chunk = resp.read(64 * 1024)
+                if not chunk:
+                    break
+                out.write(chunk)
+                done += len(chunk)
+                if progress_hook is not None:
+                    progress_hook(
+                        {
+                            "status": "downloading",
+                            "downloaded_bytes": done,
+                            "total_bytes": total or None,
+                        }
+                    )
+    except DownloadCancelled:
+        dest.unlink(missing_ok=True)
+        raise
     if progress_hook is not None:
         progress_hook({"status": "finished", "filename": str(dest)})
 
@@ -605,12 +705,14 @@ def download_yandex_music(
     status_callback: StatusCallback | None = None,
     *,
     cookies: str = "",
+    cancel_event: Event | None = None,
 ) -> Path:
     track_id = parse_yandex_track_id(url)
     if not track_id:
         raise ValueError("Нужна ссылка на трек Яндекс.Музыки (…/track/123).")
 
     def report(message: str) -> None:
+        _check_cancel(cancel_event)
         if status_callback is not None:
             status_callback(message)
 
@@ -638,7 +740,7 @@ def download_yandex_music(
     filename = _safe_filename(f"{display} [{track_id}]") + f".{ext}"
     dest = output_dir / filename
     report("Скачивание аудио…")
-    _download_binary(stream_url, dest, headers, progress_hook)
+    _download_binary(stream_url, dest, headers, progress_hook, cancel_event)
 
     albums = track.get("albums") or []
     cover = ""
@@ -654,8 +756,13 @@ def download_yandex_music(
         thumb = dest.with_suffix(".jpg")
         try:
             report("Встраивание превью…")
-            _download_binary(cover, thumb, headers, None)
-            embed_thumbnail(dest, thumb)
+            _download_binary(cover, thumb, headers, None, cancel_event)
+            embed_thumbnail(dest, thumb, cancel_event)
+        except DownloadCancelled:
+            thumb.unlink(missing_ok=True)
+            if dest.exists():
+                return dest
+            raise
         except Exception:
             thumb.unlink(missing_ok=True)
     return dest
@@ -670,6 +777,7 @@ def download_video(
     audio_only: bool = False,
     quality: str = "best",
     cookies: str = "",
+    cancel_event: Event | None = None,
 ) -> Path:
     url = url.strip()
     site = detect_site(url)
@@ -685,9 +793,11 @@ def download_video(
             progress_hook,
             status_callback,
             cookies=cookies,
+            cancel_event=cancel_event,
         )
 
     def report(message: str) -> None:
+        _check_cancel(cancel_event)
         if status_callback is not None:
             status_callback(message)
 
@@ -700,6 +810,7 @@ def download_video(
         audio_only=audio_only,
         quality=quality,
         site=site,
+        cancel_event=cancel_event,
     )
 
     last_error: Exception | None = None
@@ -708,10 +819,16 @@ def download_video(
         try:
             if attempt > 1:
                 report(f"Повтор скачивания ({attempt}/3)…")
-                time.sleep(1.5 * attempt)
-            filepath = _try_download(url, opts, report, audio_only=audio_only)
+                _interruptible_sleep(1.5 * attempt, cancel_event)
+            filepath = _try_download(
+                url, opts, report, audio_only=audio_only, cancel_event=cancel_event
+            )
             break
+        except DownloadCancelled:
+            raise
         except yt_dlp.utils.DownloadError as exc:
+            if _is_cancelled(cancel_event):
+                raise DownloadCancelled("Загрузка отменена") from None
             last_error = exc
             message = str(exc)
             # Retry only for transient CDN blocks; other errors fail fast.
@@ -727,8 +844,14 @@ def download_video(
                 "youtube": {"player_client": ["android", "android_sdkless"]},
             }
         try:
-            filepath = _try_download(url, fallback, report, audio_only=audio_only)
+            filepath = _try_download(
+                url, fallback, report, audio_only=audio_only, cancel_event=cancel_event
+            )
+        except DownloadCancelled:
+            raise
         except Exception:
+            if _is_cancelled(cancel_event):
+                raise DownloadCancelled("Загрузка отменена") from None
             assert last_error is not None
             raise last_error from None
 
@@ -745,6 +868,9 @@ def download_video(
 
     # Cover embed is mainly useful for video/audio containers.
     if filepath.suffix.lower() in {".mp4", ".m4a", ".mkv", ".webm", ".mp3"}:
-        report("Встраивание превью…")
-        filepath = embed_thumbnail(filepath)
+        try:
+            report("Встраивание превью…")
+            filepath = embed_thumbnail(filepath, cancel_event=cancel_event)
+        except DownloadCancelled:
+            return filepath
     return filepath

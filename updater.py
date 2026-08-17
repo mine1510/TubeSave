@@ -15,6 +15,7 @@ from typing import Callable
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+from boot_clean import frozen_restart_env, windows_detach_flags
 from bridge import app_root, extension_dir, user_data_dir
 from version import (
     APP_VERSION,
@@ -216,6 +217,113 @@ def install_extension_update(
     return target
 
 
+def _bat_quote(path: Path | str) -> str:
+    return str(path).replace('"', "")
+
+
+def _ps_single_quote(path: Path | str) -> str:
+    return str(path).replace("'", "''")
+
+
+def build_apply_update_script(
+    *,
+    old_pid: int,
+    new_exe: Path,
+    target_exe: Path,
+    data_dir: Path,
+    dest_ext: Path | None,
+    new_ext: Path | None,
+    staging: Path,
+    extra_cleanup_dir: Path | None = None,
+) -> str:
+    """Build a cmd script that replaces the exe after this process exits and relaunches it."""
+    exe = _bat_quote(target_exe)
+    src = _bat_quote(new_exe)
+    cwd = _bat_quote(data_dir)
+    ps_exe = _ps_single_quote(target_exe)
+    ps_cwd = _ps_single_quote(data_dir)
+    image = Path(exe).name or "TubeSave.exe"
+
+    lines = [
+        "@echo off",
+        "setlocal EnableDelayedExpansion",
+        "set n=0",
+        f"set OLD_PID={int(old_pid)}",
+        "timeout /t 2 /nobreak >nul",
+        ":wait_old",
+        f'tasklist /FI "PID eq %OLD_PID%" | find "%OLD_PID%" >nul',
+        "if not errorlevel 1 (",
+        "  timeout /t 1 /nobreak >nul",
+        "  set /a n+=1",
+        "  if !n! lss 45 goto wait_old",
+        ")",
+        "set n=0",
+        ":wait_all",
+        f'tasklist /FI "IMAGENAME eq {image}" | find /I "{image}" >nul',
+        "if not errorlevel 1 (",
+        "  timeout /t 1 /nobreak >nul",
+        "  set /a n+=1",
+        "  if !n! lss 45 goto wait_all",
+        ")",
+        "set n=0",
+        ":copy_exe",
+        f'copy /Y "{src}" "{exe}" >nul',
+        "if errorlevel 1 (",
+        "  set /a n+=1",
+        "  if !n! geq 30 goto copy_fail",
+        "  timeout /t 1 /nobreak >nul",
+        "  goto copy_exe",
+        ")",
+    ]
+    if new_ext is not None and dest_ext is not None and new_ext.exists():
+        lines.append(
+            f'xcopy /E /I /Y "{_bat_quote(new_ext)}" "{_bat_quote(dest_ext)}\\" >nul'
+        )
+    if extra_cleanup_dir is not None:
+        root = extra_cleanup_dir
+        lines.extend(
+            [
+                f'del /Q "{_bat_quote(root / "tubesave-native-host.bat")}" >nul 2>&1',
+                f'del /Q "{_bat_quote(root / "com.tubesave.host.json")}" >nul 2>&1',
+                f'del /Q "{_bat_quote(root / "native-extension-ids.json")}" >nul 2>&1',
+                f'if exist "{_bat_quote(root / "browser-extension")}" rmdir /S /Q "{_bat_quote(root / "browser-extension")}" >nul 2>&1',
+            ]
+        )
+    lines.extend(
+        [
+            "for /f \"tokens=1 delims==\" %%V in ('set _MEI 2^>nul') do set \"%%V=\"",
+            "for /f \"tokens=1 delims==\" %%V in ('set _PYI 2^>nul') do set \"%%V=\"",
+            "set _MEIPASS=",
+            "set _PYI_ARCHIVE_FILE=",
+            "set _PYI_APPLICATION_HOME_DIR=",
+            "set _PYI_PARENT_PROCESS_LEVEL=",
+            "set PYTHONHOME=",
+            "set PYTHONPATH=",
+            "set TCL_LIBRARY=",
+            "set TK_LIBRARY=",
+            "set TCLLIBPATH=",
+            "set PYINSTALLER_RESET_ENVIRONMENT=1",
+            "timeout /t 1 /nobreak >nul",
+            f'cd /d "{cwd}"',
+            "where powershell >nul 2>&1",
+            "if not errorlevel 1 (",
+            "  powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command "
+            f"\"Start-Process -FilePath '{ps_exe}' -WorkingDirectory '{ps_cwd}' -UseNewEnvironment\"",
+            ") else (",
+            f'  start "" /D "{cwd}" "{exe}"',
+            ")",
+            "timeout /t 2 /nobreak >nul",
+            f'rmdir /S /Q "{_bat_quote(staging)}" >nul 2>&1',
+            "endlocal",
+            "exit /b 0",
+            ":copy_fail",
+            "endlocal",
+            "exit /b 1",
+        ]
+    )
+    return "\r\n".join(lines) + "\r\n"
+
+
 def install_app_update(
     zip_url: str | None = None,
     status: StatusFn | None = None,
@@ -269,92 +377,38 @@ def install_app_update(
 
     target_exe = (current_exe if current_exe and current_exe.name.lower() == exe_name.lower() else root / exe_name)
     target_dir = target_exe.parent
-
-    bat = staging / "apply_update.bat"
-    # Escape paths for batch
-    def q(path: Path) -> str:
-        return str(path).replace('"', "")
-
-    old_pid = os.getpid()
-    lines = [
-        "@echo off",
-        "setlocal",
-        "set n=0",
-        f"set OLD_PID={old_pid}",
-        "timeout /t 2 /nobreak >nul",
-        ":wait_old",
-        'tasklist /FI "PID eq %OLD_PID%" | find "%OLD_PID%" >nul',
-        "if not errorlevel 1 (",
-        "  timeout /t 1 /nobreak >nul",
-        "  set /a n+=1",
-        "  if %n% lss 30 goto wait_old",
-        ")",
-        "set n=0",
-        ":copy_exe",
-        f'copy /Y "{q(new_exe)}" "{q(target_exe)}" >nul',
-        "if errorlevel 1 (",
-        "  set /a n+=1",
-        "  if %n% geq 15 goto copy_fail",
-        "  timeout /t 1 /nobreak >nul",
-        "  goto copy_exe",
-        ")",
-    ]
     data_dir = user_data_dir()
     dest_ext = extension_dir()
     data_dir.mkdir(parents=True, exist_ok=True)
     dest_ext.mkdir(parents=True, exist_ok=True)
-    if new_ext.exists():
-        lines.append(
-            f'xcopy /E /I /Y "{q(new_ext)}" "{q(dest_ext)}\\" >nul'
-        )
+
+    extra_cleanup = None
     if target_dir.resolve() != data_dir.resolve():
-        lines.extend(
-            [
-                f'del /Q "{q(target_dir / "tubesave-native-host.bat")}" >nul 2>&1',
-                f'del /Q "{q(target_dir / "com.tubesave.host.json")}" >nul 2>&1',
-                f'del /Q "{q(target_dir / "native-extension-ids.json")}" >nul 2>&1',
-                f'if exist "{q(target_dir / "browser-extension")}" rmdir /S /Q "{q(target_dir / "browser-extension")}" >nul 2>&1',
-            ]
-        )
-    lines.extend(
-        [
-            "for /f \"tokens=1 delims==\" %%V in ('set _MEI 2^>nul') do set \"%%V=\"",
-            "set _MEIPASS=",
-            "set PYTHONHOME=",
-            "set PYTHONPATH=",
-            "set TCL_LIBRARY=",
-            "set TK_LIBRARY=",
-            "set TCLLIBPATH=",
-            "timeout /t 2 /nobreak >nul",
-            f'cd /d "{q(data_dir)}"',
-            f'start "" /D "{q(data_dir)}" "{q(target_exe)}"',
-            f'rmdir /S /Q "{q(staging)}" >nul 2>&1',
-            "endlocal",
-            "exit /b 0",
-            ":copy_fail",
-            "endlocal",
-            "exit /b 1",
-        ]
+        extra_cleanup = target_dir
+
+    bat = staging / "apply_update.bat"
+    bat.write_text(
+        build_apply_update_script(
+            old_pid=os.getpid(),
+            new_exe=new_exe,
+            target_exe=target_exe,
+            data_dir=data_dir,
+            dest_ext=dest_ext,
+            new_ext=new_ext if new_ext.exists() else None,
+            staging=staging,
+            extra_cleanup_dir=extra_cleanup,
+        ),
+        encoding="utf-8",
     )
-    bat.write_text("\r\n".join(lines) + "\r\n", encoding="utf-8")
 
     if status:
         status("Перезапуск для установки обновления…")
 
-    flags = 0
-    if hasattr(subprocess, "CREATE_NO_WINDOW"):
-        flags = subprocess.CREATE_NO_WINDOW | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-    clean_env = {
-        key: value
-        for key, value in os.environ.items()
-        if not key.startswith("_MEI")
-        and key not in {"PYTHONHOME", "PYTHONPATH", "TCL_LIBRARY", "TK_LIBRARY", "TCLLIBPATH"}
-    }
     subprocess.Popen(
         ["cmd.exe", "/c", str(bat)],
-        creationflags=flags,
+        creationflags=windows_detach_flags(hide_window=True),
         cwd=str(target_dir),
-        env=clean_env,
+        env=frozen_restart_env(),
         close_fds=True,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,

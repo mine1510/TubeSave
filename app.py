@@ -22,6 +22,7 @@ from tkinter import filedialog, messagebox
 
 from downloader import (
     SUPPORTED_SITES_HINT,
+    DownloadCancelled,
     download_video,
     fetch_video_info,
     is_supported_url,
@@ -297,6 +298,7 @@ class PillButton(tk.Canvas):
         command,
         *,
         primary: bool = False,
+        danger: bool = False,
         width: int = 128,
         height: int = 40,
     ) -> None:
@@ -311,6 +313,7 @@ class PillButton(tk.Canvas):
         self._text = text
         self._command = command
         self._primary = primary
+        self._danger = danger
         self._enabled = True
         self._hover = False
         self.bind("<Enter>", self._on_enter)
@@ -326,6 +329,8 @@ class PillButton(tk.Canvas):
     def _bg(self) -> str:
         if not self._enabled:
             return COLORS["ghost"]
+        if self._danger:
+            return COLORS["danger"]
         if self._primary:
             return COLORS["accent_hover"] if self._hover else COLORS["accent"]
         return COLORS["ghost_hover"] if self._hover else COLORS["ghost"]
@@ -333,7 +338,9 @@ class PillButton(tk.Canvas):
     def _fg(self) -> str:
         if not self._enabled:
             return COLORS["muted"]
-        return "#FFFFFF" if self._primary else COLORS["text"]
+        if self._primary or self._danger:
+            return "#FFFFFF"
+        return COLORS["text"]
 
     def _draw(self) -> None:
         self.delete("all")
@@ -505,6 +512,7 @@ class YouTubeDownloaderApp(tk.Tk):
         self.configure(bg=COLORS["bg"])
         self._events: queue.Queue[tuple[str, object]] = queue.Queue()
         self._is_busy = False
+        self._cancel_event = threading.Event()
         self._quiet_download = False
         self._last_external: tuple[str, float] | None = None
         self._started_at: float | None = None
@@ -543,6 +551,8 @@ class YouTubeDownloaderApp(tk.Tk):
         self._tray_notified = bool(self._settings.get("tray_hint_shown"))
         self._update_info = None
         self._update_applying = False
+        self._is_downloading = False
+        self._update_deferred_logged = False
         self._ensure_tray()
         delay = 800 if getattr(self, "_apply_update_on_start", False) else 2500
         self.after(delay, self._check_updates_silent)
@@ -570,7 +580,7 @@ class YouTubeDownloaderApp(tk.Tk):
     def _fit_window(self) -> None:
         """Size window so action buttons are always visible on first open."""
         self.update_idletasks()
-        width = max(800, self.winfo_reqwidth())
+        width = max(900, self.winfo_reqwidth())
         height = max(720, self.winfo_reqheight() + 24)
         screen_w = self.winfo_screenwidth()
         screen_h = self.winfo_screenheight()
@@ -578,7 +588,7 @@ class YouTubeDownloaderApp(tk.Tk):
         height = min(height, max(560, screen_h - 100))
         x = max(0, (screen_w - width) // 2)
         y = max(0, (screen_h - height) // 3)
-        self.minsize(780, 700)
+        self.minsize(880, 700)
         self.geometry(f"{width}x{height}+{x}+{y}")
 
     def _register_pill(self, button: PillButton, parent_key: str = "bg") -> PillButton:
@@ -614,6 +624,18 @@ class YouTubeDownloaderApp(tk.Tk):
             )
         )
         self.audio_btn.pack(side="left", padx=(10, 0))
+
+        self.cancel_btn = self._register_pill(
+            PillButton(
+                actions,
+                "Отмена",
+                self._cancel_download,
+                danger=True,
+                width=110,
+            )
+        )
+        self.cancel_btn.pack(side="left", padx=(10, 0))
+        self.cancel_btn.set_enabled(False)
 
         exit_btn = self._register_pill(PillButton(actions, "Выход", self._quit_app, width=100))
         exit_btn.pack(side="right")
@@ -1091,22 +1113,69 @@ class YouTubeDownloaderApp(tk.Tk):
             "release_page": info.release_page,
         }
 
+    def _note_update_deferred(self) -> None:
+        if self._update_deferred_logged:
+            return
+        self._update_deferred_logged = True
+        self._log("Обновление отложено: идёт скачивание")
+
+    def _retry_update_later(self, callback) -> None:
+        self._note_update_deferred()
+        self.after(15_000, callback)
+
+    def _quit_after_update(self) -> None:
+        if self._is_downloading:
+            self._update_applying = False
+            if self._update_info is not None:
+                self._auto_apply_update(self._update_info)
+            return
+        self._stop_tray()
+        bridge = getattr(self, "_bridge", None)
+        if bridge is not None:
+            with contextlib.suppress(Exception):
+                bridge.shutdown()
+            self._bridge = None
+        with contextlib.suppress(Exception):
+            self.destroy()
+        # Hard-exit so the onefile exe unlocks and the updater can replace it.
+        os._exit(0)
+
     def _bridge_update_extension(self, url: str | None) -> dict:
+        def run() -> None:
+            if self._is_downloading:
+                self._retry_update_later(run)
+                return
+            try:
+                install_extension_update(url or None)
+                self.status_var.set("Плагин обновлён")
+            except Exception as exc:
+                messagebox.showerror("Обновление", str(exc))
+
+        if self._is_downloading:
+            self.after(0, lambda: self._retry_update_later(run))
+            return {"ok": True, "queued": True, "deferred": True}
         path = install_extension_update(url or None)
         return {"ok": True, "path": str(path), "reload": True}
 
     def _bridge_update_app(self, url: str | None) -> dict:
         # Schedule UI-thread quit after updater bat is launched.
         def apply() -> None:
+            if self._is_downloading:
+                self._retry_update_later(apply)
+                return
             try:
                 install_app_update(url or None, status=lambda m: self.status_var.set(m))
+                if self._is_downloading:
+                    self._update_applying = False
+                    self._retry_update_later(apply)
+                    return
                 notify_windows("TubeSave", "Обновление скачано. Перезапуск…")
-                self.after(800, self._quit_app)
+                self.after(800, self._quit_after_update)
             except Exception as exc:
                 messagebox.showerror("Обновление", str(exc))
 
         self.after(0, apply)
-        return {"ok": True, "queued": True}
+        return {"ok": True, "queued": True, "deferred": bool(self._is_downloading)}
 
     def _bridge_apply_updates(self) -> dict:
         info = fetch_update_info()
@@ -1115,6 +1184,7 @@ class YouTubeDownloaderApp(tk.Tk):
         return {
             "ok": True,
             "queued": True,
+            "deferred": bool(self._is_downloading),
             "app_update": info.app_update_available,
             "extension_update": info.extension_update_available,
         }
@@ -1134,9 +1204,13 @@ class YouTubeDownloaderApp(tk.Tk):
         threading.Thread(target=worker, daemon=True, name="TubeSaveUpdateCheck").start()
 
     def _auto_apply_update(self, info) -> None:
-        if self._is_busy:
-            self.after(5 * 60 * 1000, lambda: self._auto_apply_update(info))
+        if self._is_downloading:
+            self._retry_update_later(lambda i=info: self._auto_apply_update(i))
             return
+        if self._is_busy:
+            self.after(2_000, lambda i=info: self._auto_apply_update(i))
+            return
+        self._update_deferred_logged = False
         if not (info.app_update_available or info.extension_update_available):
             self.status_var.set("Версия актуальна")
             return
@@ -1155,19 +1229,32 @@ class YouTubeDownloaderApp(tk.Tk):
         self._apply_updates(info)
 
     def _apply_updates(self, info) -> None:
+        def abort_for_download() -> bool:
+            if not self._is_downloading:
+                return False
+            self._update_applying = False
+            self.after(0, lambda i=info: self._auto_apply_update(i))
+            return True
+
         def worker() -> None:
             try:
+                if abort_for_download():
+                    return
                 if info.extension_update_available:
                     self.after(0, lambda: self.status_var.set("Обновление плагина…"))
                     install_extension_update(info.extension_zip_url)
+                    if abort_for_download():
+                        return
                 if info.app_update_available:
                     self.after(0, lambda: self.status_var.set("Обновление приложения…"))
                     install_app_update(
                         info.app_zip_url,
                         status=lambda m: self.after(0, lambda: self.status_var.set(m)),
                     )
+                    if abort_for_download():
+                        return
                     self.after(0, lambda: notify_windows("TubeSave", "Перезапуск…"))
-                    self.after(600, self._quit_app)
+                    self.after(600, self._quit_after_update)
                     return
                 self.after(
                     0,
@@ -1394,10 +1481,22 @@ class YouTubeDownloaderApp(tk.Tk):
 
     def _set_busy(self, busy: bool) -> None:
         self._is_busy = busy
+        if not busy:
+            self._is_downloading = False
         enabled = not busy
         self.info_btn.set_enabled(enabled)
         self.download_btn.set_enabled(enabled)
         self.audio_btn.set_enabled(enabled)
+        self.cancel_btn.set_enabled(busy)
+
+    def _cancel_download(self) -> None:
+        if not self._is_busy:
+            return
+        self._cancel_event.set()
+        self.cancel_btn.set_enabled(False)
+        self.status_var.set("Отмена…")
+        self._set_stage("Отмена")
+        self._log("Отмена загрузки…")
 
     def _log(self, message: str) -> None:
         stamp = time.strftime("%H:%M:%S")
@@ -1488,6 +1587,17 @@ class YouTubeDownloaderApp(tk.Tk):
                         notify_windows("TubeSave — ошибка", str(message))
                     else:
                         messagebox.showerror("Ошибка", message)
+            elif event == "cancelled":
+                self._set_busy(False)
+                self._stop_timer()
+                self.progress.stop()
+                self.progress.set_value(0)
+                self.percent_var.set("0%")
+                self._set_stage("Отменено")
+                self.status_var.set("Отменено")
+                self._log(str(payload) or "Загрузка отменена")
+                if self._quiet_download:
+                    notify_windows("TubeSave", "Загрузка отменена")
 
         self.after(80, self._process_events)
 
@@ -1527,6 +1637,7 @@ class YouTubeDownloaderApp(tk.Tk):
             return
 
         url, _folder = validated
+        self._cancel_event.clear()
         self._set_busy(True)
         self._reset_metrics()
         self._start_timer()
@@ -1538,7 +1649,7 @@ class YouTubeDownloaderApp(tk.Tk):
             try:
                 label = site_label(url)
                 self._events.put(("stage", f"Запрос к {label}"))
-                info = fetch_video_info(url)
+                info = fetch_video_info(url, cancel_event=self._cancel_event)
                 title = info.get("title", "Без названия")
                 duration = info.get("duration")
                 uploader = (
@@ -1558,8 +1669,13 @@ class YouTubeDownloaderApp(tk.Tk):
                 self._events.put(("info", text))
                 self._events.put(("stage", "Информация получена"))
                 self._events.put(("done", (True, "Можно начинать скачивание.")))
+            except DownloadCancelled:
+                self._events.put(("cancelled", "Проверка отменена"))
             except Exception as exc:
-                self._events.put(("done", (False, f"Не удалось получить информацию:\n{exc}")))
+                if self._cancel_event.is_set():
+                    self._events.put(("cancelled", "Проверка отменена"))
+                else:
+                    self._events.put(("done", (False, f"Не удалось получить информацию:\n{exc}")))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -1570,7 +1686,9 @@ class YouTubeDownloaderApp(tk.Tk):
             return
 
         url, folder = validated
+        self._cancel_event.clear()
         self._set_busy(True)
+        self._is_downloading = True
         self._reset_metrics()
         self._start_timer()
         self._events.put(("progress_mode", "indeterminate"))
@@ -1653,6 +1771,7 @@ class YouTubeDownloaderApp(tk.Tk):
                         audio_only=audio_only,
                         quality=selected_quality,
                         cookies=getattr(self, "_pending_cookies", "") or "",
+                        cancel_event=self._cancel_event,
                     )
                 size = format_bytes(filepath.stat().st_size) if filepath.exists() else "—"
                 self._events.put(("size", size))
@@ -1661,7 +1780,12 @@ class YouTubeDownloaderApp(tk.Tk):
                     self._events.put(("done", (True, f"Аудио сохранено:\n{filepath}")))
                 else:
                     self._events.put(("done", (True, f"Видео сохранено:\n{filepath}")))
+            except DownloadCancelled:
+                self._events.put(("cancelled", "Загрузка отменена"))
             except Exception as exc:
+                if self._cancel_event.is_set():
+                    self._events.put(("cancelled", "Загрузка отменена"))
+                    return
                 log_output = sink.getvalue().strip()
                 if log_output:
                     self._events.put(("log", log_output[-1200:]))
