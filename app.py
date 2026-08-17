@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+import boot_clean
+
+if boot_clean.ensure_fresh_extract():
+    raise SystemExit(0)
+
 import contextlib
 import io
 import json
@@ -33,7 +38,6 @@ from bridge import (
     register_native_host,
     register_protocol,
     run_native_host,
-    runtime_cwd,
     start_bridge,
     try_apply_updates,
     try_handoff,
@@ -1675,47 +1679,9 @@ def _handoff_to_running(pending: list[tuple[str, bool, bool, str]], timeout: flo
     return is_bridge_alive() and try_focus()
 
 
-def _relaunch_without_stale_extract() -> bool:
-    """Restart this frozen exe if it inherited a dying PyInstaller unpack folder."""
-    if os.environ.get("TUBESAVE_CLEAN_START") == "1":
-        return False
-    if not getattr(sys, "frozen", False):
-        return False
-    mei = getattr(sys, "_MEIPASS", "") or os.environ.get("_MEIPASS", "")
-    if not mei:
-        return False
-    root = Path(mei)
-    imaging = list(root.glob("PIL/_imaging*.pyd")) + list(root.glob("_imaging*.pyd"))
-    if any(path.exists() and path.stat().st_size > 0 for path in imaging):
-        return False
-    env = {
-        key: value
-        for key, value in os.environ.items()
-        if not key.startswith("_MEI")
-        and key not in {"PYTHONHOME", "PYTHONPATH", "TCL_LIBRARY", "TK_LIBRARY", "TCLLIBPATH"}
-    }
-    env["TUBESAVE_CLEAN_START"] = "1"
-    flags = 0
-    if sys.platform == "win32":
-        flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
-    subprocess.Popen(
-        [sys.executable, *sys.argv[1:]],
-        cwd=str(runtime_cwd()),
-        env=env,
-        close_fds=True,
-        creationflags=flags,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    return True
-
-
 def main() -> None:
     if "--native-messaging" in sys.argv:
         run_native_host()
-        return
-    if _relaunch_without_stale_extract():
         return
     prepare_user_data()
 

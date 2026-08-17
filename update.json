@@ -1,7 +1,7 @@
 {
-  "app": "1.3.7",
+  "app": "1.3.9",
   "extension": "1.3.8",
-  "notes": "Кнопка AAC в браузере сразу запускает скачивание звука.",
+  "notes": "Исправление падения _tkinter после автообновления: новый процесс больше не использует чужую папку PyInstaller.",
   "release_page": "https://github.com/mine1510/TubeSave/releases/latest",
   "app_zip": "https://github.com/mine1510/TubeSave/releases/latest/download/TubeSave-Windows.zip",
   "extension_zip": "https://github.com/mine1510/TubeSave/releases/latest/download/TubeSave-Extension.zip"

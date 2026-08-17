@@ -318,13 +318,14 @@ def install_app_update(
         )
     lines.extend(
         [
+            "for /f \"tokens=1 delims==\" %%V in ('set _MEI 2^>nul') do set \"%%V=\"",
             "set _MEIPASS=",
-            "set _MEI=",
             "set PYTHONHOME=",
             "set PYTHONPATH=",
             "set TCL_LIBRARY=",
             "set TK_LIBRARY=",
             "set TCLLIBPATH=",
+            "timeout /t 2 /nobreak >nul",
             f'cd /d "{q(data_dir)}"',
             f'start "" /D "{q(data_dir)}" "{q(target_exe)}"',
             f'rmdir /S /Q "{q(staging)}" >nul 2>&1',

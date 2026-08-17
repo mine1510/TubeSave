@@ -13,6 +13,8 @@ hiddenimports = [
     'PIL.Image',
     'PIL.ImageDraw',
     'PIL._imaging',
+    '_tkinter',
+    'boot_clean',
 ]
 tmp_ret = collect_all('imageio_ffmpeg')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
@@ -40,7 +42,7 @@ a = Analysis(
     hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},
-    runtime_hooks=[],
+    runtime_hooks=['rthook_tubesave.py'],
     excludes=[],
     noarchive=False,
     optimize=0,
