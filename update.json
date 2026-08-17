@@ -1,7 +1,7 @@
 {
-  "app": "1.3.11",
-  "extension": "1.3.11",
-  "notes": "Отмена загрузки, без обновления во время скачивания, исправлен перезапуск после обновления.",
+  "app": "1.3.12",
+  "extension": "1.3.12",
+  "notes": "Новая иконка: логотип YouTube со стрелкой скачивания.",
   "release_page": "https://github.com/mine1510/TubeSave/releases/latest",
   "app_zip": "https://github.com/mine1510/TubeSave/releases/latest/download/TubeSave-Windows.zip",
   "extension_zip": "https://github.com/mine1510/TubeSave/releases/latest/download/TubeSave-Extension.zip"

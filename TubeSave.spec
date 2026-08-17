@@ -34,6 +34,12 @@ if ext_dir.is_dir():
             datas.append((str(file), str(Path('browser-extension') / file.relative_to(ext_dir).parent)))
 
 
+assets_dir = Path('assets')
+if assets_dir.is_dir():
+    for file in assets_dir.iterdir():
+        if file.is_file() and file.suffix.lower() in {'.png', '.ico'}:
+            datas.append((str(file), 'assets'))
+
 a = Analysis(
     ['app.py'],
     pathex=[],
@@ -68,4 +74,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon='assets/tubesave.ico',
 )

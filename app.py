@@ -52,6 +52,22 @@ from updater import (
 from version import APP_VERSION, EXTENSION_VERSION
 
 
+def resolve_app_asset(*parts: str) -> Path | None:
+    """Find a bundled icon/asset in the frozen extract or the source tree."""
+    rel = Path(*parts)
+    candidates = [
+        Path(getattr(sys, "_MEIPASS", "")) / rel,
+        Path(getattr(sys, "_MEIPASS", "")) / "assets" / rel.name,
+        Path(__file__).resolve().parent / rel,
+        Path(__file__).resolve().parent / "assets" / rel.name,
+        Path(__file__).resolve().parent / "browser-extension" / "icons" / rel.name,
+    ]
+    for path in candidates:
+        if path.is_file():
+            return path
+    return None
+
+
 def notify_windows(title: str, message: str) -> None:
     """Show a Windows toast notification (no blocking dialog)."""
     body = " ".join(str(message).split())
@@ -530,7 +546,9 @@ class YouTubeDownloaderApp(tk.Tk):
         self._pill_buttons: list[tuple[PillButton, str]] = []
         self._quality_chips: list[QualityChip] = []
         self._context_menus: list[tk.Menu] = []
+        self._bg_image_labels: list[tk.Label] = []
 
+        self._set_window_icon()
         self._build_ui()
         self._apply_theme()
         self._fit_window()
@@ -576,6 +594,17 @@ class YouTubeDownloaderApp(tk.Tk):
     def _persist_quality(self) -> None:
         self._settings["quality"] = self._quality
         save_settings(self._settings)
+
+    def _set_window_icon(self) -> None:
+        ico = resolve_app_asset("assets", "tubesave.ico")
+        png = resolve_app_asset("assets", "tubesave-32.png")
+        if ico is not None:
+            with contextlib.suppress(tk.TclError, OSError):
+                self.iconbitmap(str(ico))
+        if png is not None:
+            with contextlib.suppress(tk.TclError, OSError):
+                self._window_icon = tk.PhotoImage(file=str(png))
+                self.iconphoto(True, self._window_icon)
 
     def _fit_window(self) -> None:
         """Size window so action buttons are always visible on first open."""
@@ -654,8 +683,19 @@ class YouTubeDownloaderApp(tk.Tk):
         header.pack(fill="x")
         self._bg_frames.append(header)
 
+        brand_row = tk.Frame(header, bg=COLORS["bg"])
+        brand_row.pack(side="left", anchor="w")
+        self._bg_frames.append(brand_row)
+
+        logo_path = resolve_app_asset("assets", "tubesave-32.png")
+        if logo_path is not None:
+            self._brand_logo = tk.PhotoImage(file=str(logo_path))
+            logo = tk.Label(brand_row, image=self._brand_logo, bg=COLORS["bg"], bd=0)
+            logo.pack(side="left", padx=(0, 10))
+            self._bg_image_labels.append(logo)
+
         brand = tk.Label(
-            header,
+            brand_row,
             text=f"TubeSave  v{APP_VERSION}",
             font=FONTS["brand"],
             fg=COLORS["text"],
@@ -941,6 +981,8 @@ class YouTubeDownloaderApp(tk.Tk):
         COLORS.update(palette)
 
         self.configure(bg=COLORS["bg"])
+        for label in self._bg_image_labels:
+            label.configure(bg=COLORS["bg"])
         for frame in self._bg_frames:
             frame.configure(bg=COLORS["bg"])
         for frame in self._surface_frames:
