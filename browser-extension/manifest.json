@@ -1,0 +1,80 @@
+{
+  "manifest_version": 3,
+  "name": "TubeSave",
+  "version": "1.2.0",
+  "description": "Скачать видео/Shorts/клипы/музыку в TubeSave — Chrome, Edge, Яндекс.Браузер.",
+  "permissions": ["activeTab", "tabs", "scripting", "alarms"],
+  "host_permissions": [
+    "http://127.0.0.1:17834/*",
+    "http://localhost:17834/*",
+    "https://raw.githubusercontent.com/*",
+    "https://api.github.com/*",
+    "https://github.com/*",
+    "*://*.youtube.com/*",
+    "*://youtu.be/*",
+    "*://*.vk.com/*",
+    "*://*.vkvideo.ru/*",
+    "*://*.pornhub.com/*",
+    "*://*.iwara.tv/*",
+    "*://*.rule34.xxx/*",
+    "*://*.rule34video.com/*",
+    "*://music.yandex.ru/*",
+    "*://music.yandex.com/*",
+    "*://music.yandex.by/*",
+    "*://music.yandex.kz/*",
+    "*://music.yandex.ua/*",
+    "*://m.music.yandex.ru/*"
+  ],
+  "action": {
+    "default_title": "Скачать в TubeSave",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "*://www.youtube.com/*",
+        "*://youtube.com/*",
+        "*://m.youtube.com/*"
+      ],
+      "js": ["content-youtube.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "*://vk.com/*",
+        "*://www.vk.com/*",
+        "*://m.vk.com/*",
+        "*://vkvideo.ru/*",
+        "*://www.vkvideo.ru/*",
+        "*://m.vkvideo.ru/*"
+      ],
+      "js": ["content-vk.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "*://music.yandex.ru/*",
+        "*://music.yandex.com/*",
+        "*://music.yandex.by/*",
+        "*://music.yandex.kz/*",
+        "*://music.yandex.ua/*",
+        "*://m.music.yandex.ru/*"
+      ],
+      "js": ["content-yandex-music.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}

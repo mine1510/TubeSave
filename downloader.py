@@ -1,4 +1,4 @@
-"""YouTube video downloader powered by yt-dlp."""
+"""Media downloader powered by yt-dlp (YouTube, VK, Iwara, PornHub, Rule34, …)."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ import subprocess
 import time
 from pathlib import Path
 from typing import Callable
+from urllib.parse import urlparse
 
 import yt_dlp
 
@@ -15,16 +16,109 @@ ProgressCallback = Callable[[dict], None]
 StatusCallback = Callable[[str], None]
 
 
-YOUTUBE_URL_PATTERN = re.compile(
-    r"^https?://(?:www\.)?(?:youtube\.com/(?:watch\?v=|shorts/|embed/|live/)|youtu\.be/)",
-    re.IGNORECASE,
+SITE_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
+    (
+        "youtube",
+        re.compile(
+            r"^https?://(?:www\.)?(?:youtube\.com/(?:watch\?v=|shorts/|embed/|live/)|youtu\.be/)",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "vk",
+        re.compile(
+            r"^https?://(?:(?:www|m)\.)?(?:vk\.com|vkvideo\.ru)/",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "yandexmusic",
+        re.compile(
+            r"^https?://(?:(?:www|m)\.)?music\.yandex\.(?:ru|com|by|kz|ua)/",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "rule34",
+        re.compile(
+            r"^https?://(?:www\.)?(?:rule34\.xxx|rule34video\.com)/",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "iwara",
+        re.compile(
+            r"^https?://(?:www\.)?(?:iwara\.tv|ecchi\.iwara\.tv)/",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "pornhub",
+        re.compile(
+            r"^https?://(?:[\w-]+\.)?pornhub\.com/",
+            re.IGNORECASE,
+        ),
+    ),
+]
+
+SITE_LABELS = {
+    "youtube": "YouTube",
+    "vk": "VK Video",
+    "yandexmusic": "Яндекс.Музыка",
+    "rule34": "Rule34",
+    "iwara": "Iwara",
+    "pornhub": "PornHub",
+}
+
+SUPPORTED_SITES_HINT = (
+    "youtube.com / youtu.be / shorts\n"
+    "vkvideo.ru / vk.com (видео и клипы)\n"
+    "music.yandex.ru\n"
+    "rule34.xxx / rule34video.com\n"
+    "iwara.tv\n"
+    "pornhub.com"
 )
 
 _IMPERSONATE_TARGET = None
 
 
+def detect_site(url: str) -> str | None:
+    text = url.strip()
+    for name, pattern in SITE_PATTERNS:
+        if pattern.match(text):
+            return name
+    # Fallback: host contains known brand (covers odd subdomains / query forms)
+    try:
+        host = (urlparse(text).hostname or "").lower()
+    except Exception:
+        return None
+    if host.endswith("youtube.com") or host == "youtu.be":
+        return "youtube"
+    if host.endswith("vk.com") or host.endswith("vkvideo.ru"):
+        return "vk"
+    if "music.yandex." in host:
+        return "yandexmusic"
+    if host.endswith("rule34.xxx") or host.endswith("rule34video.com"):
+        return "rule34"
+    if host.endswith("iwara.tv"):
+        return "iwara"
+    if host.endswith("pornhub.com"):
+        return "pornhub"
+    return None
+
+
+def is_supported_url(url: str) -> bool:
+    return detect_site(url) is not None
+
+
 def is_youtube_url(url: str) -> bool:
-    return bool(YOUTUBE_URL_PATTERN.match(url.strip()))
+    """Backward-compatible alias."""
+    return detect_site(url) == "youtube"
+
+
+def site_label(url: str) -> str:
+    site = detect_site(url)
+    return SITE_LABELS.get(site or "", "Видео")
 
 
 def get_ffmpeg_location() -> str:
@@ -118,29 +212,52 @@ def embed_thumbnail(video_path: Path, thumb_path: Path | None = None) -> Path:
     return video_path
 
 
-def format_selector(*, audio_only: bool = False, quality: str = "best") -> str:
+def format_selector(
+    *,
+    audio_only: bool = False,
+    quality: str = "best",
+    site: str | None = None,
+) -> str:
     """Build yt-dlp format string for video quality or audio-only."""
     if audio_only:
         return "ba[ext=m4a]/ba[acodec^=mp4a]/ba/b"
 
     quality = (quality or "best").strip().lower()
+    prefer_avc = site in {None, "youtube"}
+
+    def with_height(height: int) -> str:
+        if prefer_avc:
+            return (
+                f"bv*[height<=?{height}][vcodec^=avc1]+ba[ext=m4a]/"
+                f"bv*[height<=?{height}]+ba[ext=m4a]/"
+                f"bv*[height<=?{height}]+ba/"
+                f"best[height<=?{height}][ext=mp4]/best[height<=?{height}]/"
+                f"bv*+ba/b"
+            )
+        return (
+            f"bv*[height<=?{height}]+ba/"
+            f"best[height<=?{height}][ext=mp4]/best[height<=?{height}]/"
+            f"bv*+ba/b"
+        )
+
     if quality in {"best", "max", "highest"}:
-        return "bv*[vcodec^=avc1]+ba[ext=m4a]/bv*+ba[ext=m4a]/bv*+ba/b"
+        if prefer_avc:
+            return "bv*[vcodec^=avc1]+ba[ext=m4a]/bv*+ba[ext=m4a]/bv*+ba/b"
+        return "bv*+ba/b"
 
     try:
         height = int(quality.rstrip("p"))
     except ValueError:
-        return "bv*[vcodec^=avc1]+ba[ext=m4a]/bv*+ba[ext=m4a]/bv*+ba/b"
+        return "bv*[vcodec^=avc1]+ba[ext=m4a]/bv*+ba[ext=m4a]/bv*+ba/b" if prefer_avc else "bv*+ba/b"
 
-    return (
-        f"bv*[height<=?{height}][vcodec^=avc1]+ba[ext=m4a]/"
-        f"bv*[height<=?{height}]+ba[ext=m4a]/"
-        f"bv*[height<=?{height}]+ba/"
-        f"bv*[vcodec^=avc1]+ba[ext=m4a]/bv*+ba[ext=m4a]/bv*+ba/b"
-    )
+    return with_height(height)
 
 
-def fallback_format_selector(*, audio_only: bool = False, quality: str = "best") -> str:
+def fallback_format_selector(
+    *,
+    audio_only: bool = False,
+    quality: str = "best",
+) -> str:
     if audio_only:
         return "ba/b"
     quality = (quality or "best").strip().lower()
@@ -160,6 +277,7 @@ def build_ydl_opts(
     *,
     audio_only: bool = False,
     quality: str = "best",
+    site: str | None = None,
 ) -> dict:
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -178,7 +296,7 @@ def build_ydl_opts(
         "no_warnings": True,
         "noprogress": True,
         "restrictfilenames": False,
-        "format": format_selector(audio_only=audio_only, quality=quality),
+        "format": format_selector(audio_only=audio_only, quality=quality, site=site),
         "postprocessors": [
             {
                 "key": "FFmpegThumbnailsConvertor",
@@ -199,6 +317,7 @@ def build_ydl_opts(
     else:
         opts["merge_output_format"] = "mp4"
 
+    # Browser impersonation helps YouTube CDN; also fine for most other sites.
     impersonate = get_impersonate_target()
     if impersonate is not None:
         opts["impersonate"] = impersonate
@@ -233,6 +352,11 @@ def build_ydl_opts(
 
 
 def fetch_video_info(url: str) -> dict:
+    url = url.strip()
+    if detect_site(url) is None:
+        raise ValueError(
+            "Неподдерживаемая ссылка. Доступны:\n" + SUPPORTED_SITES_HINT
+        )
     opts = {
         "quiet": True,
         "no_warnings": True,
@@ -243,7 +367,7 @@ def fetch_video_info(url: str) -> dict:
     if impersonate is not None:
         opts["impersonate"] = impersonate
     with yt_dlp.YoutubeDL(opts) as ydl:
-        return ydl.extract_info(url.strip(), download=False)
+        return ydl.extract_info(url, download=False)
 
 
 def _resolve_output_path(
@@ -303,20 +427,28 @@ def download_video(
     quality: str = "best",
 ) -> Path:
     url = url.strip()
-    if not is_youtube_url(url):
-        raise ValueError("Укажите корректную ссылку на YouTube (видео или Shorts).")
+    site = detect_site(url)
+    if site is None:
+        raise ValueError(
+            "Неподдерживаемая ссылка. Доступны:\n" + SUPPORTED_SITES_HINT
+        )
+    # Yandex Music tracks are audio — always extract M4A/MP3.
+    if site == "yandexmusic":
+        audio_only = True
 
     def report(message: str) -> None:
         if status_callback is not None:
             status_callback(message)
 
-    report("Подключение к YouTube…")
+    label = SITE_LABELS.get(site, "сайт")
+    report(f"Подключение к {label}…")
     opts = build_ydl_opts(
         output_dir,
         progress_hook,
         status_callback,
         audio_only=audio_only,
         quality=quality,
+        site=site,
     )
 
     last_error: Exception | None = None
@@ -331,16 +463,18 @@ def download_video(
         except yt_dlp.utils.DownloadError as exc:
             last_error = exc
             message = str(exc)
+            # Retry only for transient CDN blocks; other errors fail fast.
             if "403" not in message and "Forbidden" not in message:
                 raise
 
     if filepath is None:
-        report("Обход блокировки YouTube…")
+        report("Обход блокировки…")
         fallback = dict(opts)
         fallback["format"] = fallback_format_selector(audio_only=audio_only, quality=quality)
-        fallback["extractor_args"] = {
-            "youtube": {"player_client": ["android", "android_sdkless"]},
-        }
+        if site == "youtube":
+            fallback["extractor_args"] = {
+                "youtube": {"player_client": ["android", "android_sdkless"]},
+            }
         try:
             filepath = _try_download(url, fallback, report, audio_only=audio_only)
         except Exception:
@@ -358,6 +492,8 @@ def download_video(
         if mp4_path.exists():
             filepath = mp4_path
 
-    report("Встраивание превью…")
-    filepath = embed_thumbnail(filepath)
+    # Cover embed is mainly useful for video/audio containers.
+    if filepath.suffix.lower() in {".mp4", ".m4a", ".mkv", ".webm", ".mp3"}:
+        report("Встраивание превью…")
+        filepath = embed_thumbnail(filepath)
     return filepath

@@ -1,4 +1,4 @@
-"""Modern minimal GUI for downloading YouTube videos and Shorts as MP4."""
+"""Modern minimal GUI for TubeSave — multi-site video/audio downloader."""
 
 from __future__ import annotations
 
@@ -14,7 +14,30 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox
 
-from downloader import download_video, fetch_video_info, is_youtube_url
+from downloader import (
+    SUPPORTED_SITES_HINT,
+    download_video,
+    fetch_video_info,
+    is_supported_url,
+    site_label,
+)
+from bridge import (
+    BRIDGE_PORT,
+    collect_launch_urls,
+    extension_dir,
+    is_bridge_alive,
+    register_protocol,
+    start_bridge,
+    try_handoff,
+    try_focus,
+)
+from updater import (
+    fetch_update_info,
+    install_app_update,
+    install_extension_update,
+    open_releases_page,
+)
+from version import APP_VERSION, EXTENSION_VERSION
 
 
 def notify_windows(title: str, message: str) -> None:
@@ -453,7 +476,7 @@ class YouTubeDownloaderApp(tk.Tk):
         self.title("TubeSave")
         self.resizable(True, True)
 
-        default_dir = Path.home() / "Downloads" / "YouTube"
+        default_dir = Path.home() / "Downloads" / "TubeSave"
         self._settings = load_settings()
         saved_dir = str(self._settings.get("download_dir") or "").strip()
         self.download_dir = Path(saved_dir) if saved_dir else default_dir
@@ -487,6 +510,22 @@ class YouTubeDownloaderApp(tk.Tk):
         self._apply_theme()
         self._fit_window()
         self.after(80, self._process_events)
+        self._bridge = start_bridge(
+            self._on_bridge_url,
+            self._on_bridge_focus,
+            on_check_update=self._bridge_check_update,
+            on_update_extension=self._bridge_update_extension,
+            on_update_app=self._bridge_update_app,
+        )
+        register_protocol()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self._tray = None
+        self._tray_thread = None
+        self._tray_notified = bool(self._settings.get("tray_hint_shown"))
+        self._update_info = None
+        self._ensure_tray()
+        self.after(2500, self._check_updates_silent)
+
 
     def _persist_folder(self, folder: str | Path) -> None:
         folder_str = str(folder).strip()
@@ -552,8 +591,24 @@ class YouTubeDownloaderApp(tk.Tk):
         )
         self.audio_btn.pack(side="left", padx=(10, 0))
 
-        exit_btn = self._register_pill(PillButton(actions, "Выход", self.destroy, width=100))
+        exit_btn = self._register_pill(PillButton(actions, "Выход", self._quit_app, width=100))
         exit_btn.pack(side="right")
+
+        browser_btn = self._register_pill(
+            PillButton(actions, "Браузер", self._show_browser_help, width=100)
+        )
+        browser_btn.pack(side="right", padx=(0, 10))
+
+        hide_btn = self._register_pill(
+            PillButton(actions, "В трей", self._minimize_to_tray, width=100)
+        )
+        hide_btn.pack(side="right", padx=(0, 10))
+
+        update_btn = self._register_pill(
+            PillButton(actions, "Обновить", self._check_updates_manual, width=110)
+        )
+        update_btn.pack(side="right", padx=(0, 10))
+        self.update_btn = update_btn
 
         # Scrollable-feeling content above buttons
         content = tk.Frame(root, bg=COLORS["bg"])
@@ -566,7 +621,7 @@ class YouTubeDownloaderApp(tk.Tk):
 
         brand = tk.Label(
             header,
-            text="TubeSave",
+            text=f"TubeSave  v{APP_VERSION}",
             font=FONTS["brand"],
             fg=COLORS["text"],
             bg=COLORS["bg"],
@@ -594,7 +649,7 @@ class YouTubeDownloaderApp(tk.Tk):
 
         subtitle = tk.Label(
             content,
-            text="Видео и Shorts в MP4 — максимальное качество со звуком",
+            text="YouTube · VK · Я.Музыка · Iwara · PornHub · Rule34",
             font=FONTS["body"],
             fg=COLORS["muted"],
             bg=COLORS["bg"],
@@ -1006,6 +1061,311 @@ class YouTubeDownloaderApp(tk.Tk):
         except OSError as exc:
             messagebox.showerror("Папка", f"Не удалось открыть папку:\n{exc}")
 
+    def _bridge_check_update(self) -> dict:
+        info = fetch_update_info()
+        self._update_info = info
+        return {
+            "ok": True,
+            "local_app": APP_VERSION,
+            "local_extension": EXTENSION_VERSION,
+            "remote_app": info.app_version,
+            "remote_extension": info.extension_version,
+            "app_update": info.app_update_available,
+            "extension_update": info.extension_update_available,
+            "app_zip": info.app_zip_url,
+            "extension_zip": info.extension_zip_url,
+            "notes": info.notes,
+            "release_page": info.release_page,
+        }
+
+    def _bridge_update_extension(self, url: str | None) -> dict:
+        path = install_extension_update(url or None)
+        return {"ok": True, "path": str(path), "reload": True}
+
+    def _bridge_update_app(self, url: str | None) -> dict:
+        # Schedule UI-thread quit after updater bat is launched.
+        def apply() -> None:
+            try:
+                install_app_update(url or None, status=lambda m: self.status_var.set(m))
+                notify_windows("TubeSave", "Обновление скачано. Перезапуск…")
+                self.after(800, self._quit_app)
+            except Exception as exc:
+                messagebox.showerror("Обновление", str(exc))
+
+        self.after(0, apply)
+        return {"ok": True, "queued": True}
+
+    def _check_updates_silent(self) -> None:
+        def worker() -> None:
+            try:
+                info = fetch_update_info()
+                self._update_info = info
+                if info.app_update_available or info.extension_update_available:
+                    parts = []
+                    if info.app_update_available:
+                        parts.append(f"приложение {APP_VERSION} → {info.app_version}")
+                    if info.extension_update_available:
+                        parts.append(
+                            f"плагин {EXTENSION_VERSION} → {info.extension_version}"
+                        )
+                    msg = "Доступно обновление: " + ", ".join(parts)
+                    self.after(0, lambda: self._notify_update_available(msg, info))
+            except Exception:
+                pass
+
+        threading.Thread(target=worker, daemon=True, name="TubeSaveUpdateCheck").start()
+
+    def _notify_update_available(self, message: str, info) -> None:
+        self.status_var.set(message)
+        self._log(message)
+        notify_windows("TubeSave — обновление", message)
+        if messagebox.askyesno(
+            "Обновление TubeSave",
+            f"{message}\n\nУстановить сейчас?\n\n{info.notes[:240]}".strip(),
+        ):
+            self._apply_updates(info)
+
+    def _check_updates_manual(self) -> None:
+        if self._is_busy:
+            messagebox.showinfo("Обновление", "Дождитесь окончания скачивания.")
+            return
+        self.status_var.set("Проверка обновлений…")
+
+        def worker() -> None:
+            try:
+                info = fetch_update_info()
+                self._update_info = info
+                self.after(0, lambda: self._handle_manual_update_result(info))
+            except Exception as exc:
+                self.after(
+                    0,
+                    lambda: messagebox.showerror(
+                        "Обновление",
+                        f"Не удалось проверить обновления:\n{exc}",
+                    ),
+                )
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _handle_manual_update_result(self, info) -> None:
+        if not info.app_update_available and not info.extension_update_available:
+            messagebox.showinfo(
+                "Обновление",
+                f"У вас актуальная версия.\nПриложение: {APP_VERSION}\nПлагин: {EXTENSION_VERSION}",
+            )
+            self.status_var.set("Обновлений нет")
+            return
+        parts = []
+        if info.app_update_available:
+            parts.append(f"Приложение: {APP_VERSION} → {info.app_version}")
+        if info.extension_update_available:
+            parts.append(f"Плагин: {EXTENSION_VERSION} → {info.extension_version}")
+        text = "\n".join(parts)
+        if info.notes:
+            text += f"\n\n{info.notes[:300]}"
+        if messagebox.askyesno("Обновление TubeSave", f"{text}\n\nУстановить?"):
+            self._apply_updates(info)
+        else:
+            open_releases_page()
+
+    def _apply_updates(self, info) -> None:
+        def worker() -> None:
+            try:
+                if info.extension_update_available:
+                    self.after(0, lambda: self.status_var.set("Обновление плагина…"))
+                    install_extension_update(info.extension_zip_url)
+                if info.app_update_available:
+                    self.after(0, lambda: self.status_var.set("Обновление приложения…"))
+                    install_app_update(
+                        info.app_zip_url,
+                        status=lambda m: self.after(0, lambda: self.status_var.set(m)),
+                    )
+                    self.after(0, lambda: notify_windows("TubeSave", "Перезапуск…"))
+                    self.after(600, self._quit_app)
+                    return
+                self.after(
+                    0,
+                    lambda: messagebox.showinfo(
+                        "Обновление",
+                        "Плагин обновлён на диске.\n"
+                        "В браузере нажмите «Обновить» на странице расширений\n"
+                        "или дождитесь автоперезагрузки плагина.",
+                    ),
+                )
+                self.after(0, lambda: self.status_var.set("Плагин обновлён"))
+            except Exception as exc:
+                self.after(0, lambda: messagebox.showerror("Обновление", str(exc)))
+
+        threading.Thread(target=worker, daemon=True, name="TubeSaveApplyUpdate").start()
+
+    def _tray_icon_image(self):
+        from PIL import Image, ImageDraw
+
+        # Prefer packaged extension icon when available.
+        for candidate in (
+            extension_dir() / "icons" / "icon128.png",
+            Path(__file__).resolve().parent / "browser-extension" / "icons" / "icon128.png",
+        ):
+            if candidate.exists():
+                with contextlib.suppress(OSError):
+                    return Image.open(candidate).convert("RGBA")
+
+        size = 64
+        image = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(image)
+        draw.rounded_rectangle((2, 2, size - 3, size - 3), radius=14, fill=(47, 111, 237, 255))
+        # Simple download arrow
+        draw.rectangle((28, 14, 36, 34), fill=(255, 255, 255, 255))
+        draw.polygon([(18, 32), (46, 32), (32, 48)], fill=(255, 255, 255, 255))
+        draw.rectangle((18, 50, 46, 56), fill=(255, 255, 255, 255))
+        return image
+
+    def _ensure_tray(self) -> None:
+        if self._tray is not None:
+            return
+        try:
+            import pystray
+        except ImportError:
+            return
+
+        menu = pystray.Menu(
+            pystray.MenuItem("Открыть TubeSave", self._tray_show, default=True),
+            pystray.MenuItem("Выход", self._tray_quit),
+        )
+        self._tray = pystray.Icon(
+            "TubeSave",
+            self._tray_icon_image(),
+            "TubeSave",
+            menu,
+        )
+
+        def run_tray() -> None:
+            assert self._tray is not None
+            self._tray.run()
+
+        self._tray_thread = threading.Thread(target=run_tray, name="TubeSaveTray", daemon=True)
+        self._tray_thread.start()
+
+    def _tray_show(self, _icon=None, _item=None) -> None:
+        self.after(0, self._bring_to_front)
+
+    def _tray_quit(self, _icon=None, _item=None) -> None:
+        self.after(0, self._quit_app)
+
+    def _stop_tray(self) -> None:
+        tray = self._tray
+        self._tray = None
+        if tray is not None:
+            with contextlib.suppress(Exception):
+                tray.stop()
+
+    def _minimize_to_tray(self) -> None:
+        self._ensure_tray()
+        self.withdraw()
+        if not self._tray_notified:
+            self._tray_notified = True
+            self._settings["tray_hint_shown"] = True
+            save_settings(self._settings)
+            notify_windows(
+                "TubeSave",
+                "Приложение свёрнуто в трей. Откройте через скрытые значки на панели задач.",
+            )
+
+    def _on_close(self) -> None:
+        # Close button (X) hides to tray instead of quitting.
+        self._minimize_to_tray()
+
+    def _quit_app(self) -> None:
+        self._stop_tray()
+        bridge = getattr(self, "_bridge", None)
+        if bridge is not None:
+            with contextlib.suppress(Exception):
+                bridge.shutdown()
+            self._bridge = None
+        self.destroy()
+
+    def _on_bridge_url(self, url: str, auto_start: bool, audio_only: bool = False) -> None:
+        # HTTP thread → UI thread
+        self.after(
+            0,
+            lambda: self.receive_external_url(
+                url, auto_start=auto_start, audio_only=audio_only
+            ),
+        )
+
+    def _on_bridge_focus(self) -> None:
+        self.after(0, self._bring_to_front)
+
+    def _bring_to_front(self) -> None:
+        self.deiconify()
+        self.state("normal")
+        self.lift()
+        self.attributes("-topmost", True)
+        self.after(200, lambda: self.attributes("-topmost", False))
+        with contextlib.suppress(tk.TclError):
+            self.focus_force()
+
+    def receive_external_url(
+        self,
+        url: str,
+        *,
+        auto_start: bool = True,
+        audio_only: bool = False,
+    ) -> None:
+        """Fill the URL field from browser extension / protocol / second instance."""
+        url = (url or "").strip()
+        if not url:
+            return
+
+        # Music links always go through audio pipeline.
+        if "music.yandex." in url.lower():
+            audio_only = True
+
+        self._bring_to_front()
+        self.url_var.set(url)
+        kind = "аудио" if audio_only else "видео"
+        self._log(f"Из браузера ({kind}): {url}")
+        self.status_var.set(f"Ссылка получена · {site_label(url)}")
+
+        if not is_supported_url(url):
+            messagebox.showwarning(
+                "Ссылка",
+                "Ссылка получена, но сайт не поддерживается:\n"
+                + SUPPORTED_SITES_HINT,
+            )
+            return
+
+        if auto_start:
+            if self._is_busy:
+                self.status_var.set("Занято — ссылка вставлена, скачивание не запущено")
+                notify_windows("TubeSave", "Ссылка вставлена. Дождитесь конца текущей загрузки.")
+                return
+            self._start_download(audio_only=audio_only)
+
+    def _show_browser_help(self) -> None:
+        folder = extension_dir()
+        folder.mkdir(parents=True, exist_ok=True)
+        register_protocol()
+        with contextlib.suppress(OSError):
+            os.startfile(folder)  # type: ignore[attr-defined]
+
+        messagebox.showinfo(
+            "Кнопка в браузере",
+            "Расширение TubeSave для Chrome / Edge / Яндекс.Браузер:\n\n"
+            "1. Откройте страницу расширений:\n"
+            "   • Chrome: chrome://extensions\n"
+            "   • Edge: edge://extensions\n"
+            "   • Яндекс: browser://extensions\n"
+            "2. Включите «Режим разработчика»\n"
+            "3. «Загрузить распакованное расширение»\n"
+            f"4. Выберите папку:\n{folder}\n\n"
+            "На YouTube появится кнопка TubeSave; также работает иконка\n"
+            "расширения на панели браузера.\n\n"
+            f"Приложение должно быть запущено (порт {BRIDGE_PORT}).\n"
+            "Протокол tubesave:// зарегистрирован — если TubeSave закрыт,\n"
+            "расширение попробует его открыть.",
+        )
+
     def _set_busy(self, busy: bool) -> None:
         self._is_busy = busy
         enabled = not busy
@@ -1107,11 +1467,10 @@ class YouTubeDownloaderApp(tk.Tk):
         if not url:
             messagebox.showwarning("Ссылка", "Вставьте ссылку на видео.")
             return None
-        if not is_youtube_url(url):
+        if not is_supported_url(url):
             messagebox.showwarning(
                 "Ссылка",
-                "Неверная ссылка. Поддерживаются:\n"
-                "youtube.com/watch · youtube.com/shorts · youtu.be",
+                "Неверная ссылка. Поддерживаются:\n" + SUPPORTED_SITES_HINT,
             )
             return None
 
@@ -1141,18 +1500,24 @@ class YouTubeDownloaderApp(tk.Tk):
 
         def worker() -> None:
             try:
-                self._events.put(("stage", "Запрос к YouTube"))
+                label = site_label(url)
+                self._events.put(("stage", f"Запрос к {label}"))
                 info = fetch_video_info(url)
                 title = info.get("title", "Без названия")
                 duration = info.get("duration")
-                uploader = info.get("uploader", "Неизвестно")
+                uploader = (
+                    info.get("uploader")
+                    or info.get("channel")
+                    or info.get("creator")
+                    or "Неизвестно"
+                )
                 is_short = "/shorts/" in url.lower()
                 duration_text = format_duration(float(duration) if duration else None)
+                kind = "Shorts" if is_short else label
 
                 text = (
                     f"{title}\n"
-                    f"{uploader} · {duration_text} · "
-                    f"{'Shorts' if is_short else 'Видео'}"
+                    f"{uploader} · {duration_text} · {kind}"
                 )
                 self._events.put(("info", text))
                 self._events.put(("stage", "Информация получена"))
@@ -1189,15 +1554,20 @@ class YouTubeDownloaderApp(tk.Tk):
 
         def status_callback(message: str) -> None:
             stage_map = {
-                "Подключение к YouTube…": "Подключение",
                 "Получение информации о видео…": "Метаданные",
                 "Объединение видео и аудио…": "Слияние",
                 "Конвертация в MP4…": "Конвертация",
                 "Сохранение файла…": "Сохранение",
                 "Проверка результата…": "Проверка",
                 "Объединение завершено": "Слияние",
+                "Встраивание превью…": "Превью",
+                "Обход блокировки…": "Обход",
             }
             stage = stage_map.get(message)
+            if stage is None and message.startswith("Подключение к "):
+                stage = "Подключение"
+            elif stage is None and message.startswith("Повтор скачивания"):
+                stage = "Повтор"
             if stage:
                 self._events.put(("stage", stage))
             self._events.put(("status", message))
@@ -1263,7 +1633,24 @@ class YouTubeDownloaderApp(tk.Tk):
 
 
 def main() -> None:
+    pending = collect_launch_urls()
+
+    # Second instance: hand off URL(s) to the running app and exit.
+    if pending:
+        if all(try_handoff(url, auto, audio) for url, auto, audio in pending):
+            return
+    elif is_bridge_alive() and try_focus():
+        # Already running — just bring it forward.
+        return
+
     app = YouTubeDownloaderApp()
+    for url, auto, audio in pending:
+        app.after(
+            300,
+            lambda u=url, a=auto, au=audio: app.receive_external_url(
+                u, auto_start=a, audio_only=au
+            ),
+        )
     app.mainloop()
 
 
