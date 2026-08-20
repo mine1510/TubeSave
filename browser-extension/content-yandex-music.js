@@ -1,32 +1,202 @@
 (() => {
-  const BTN_ID = "tubesave-ym-btn";
+  const PANEL_ID = "tubesave-ym-panel";
+  const PAGE_ID = "tubesave-ym-btn";
   const FLOAT_ID = "tubesave-ym-float";
 
-  function trackUrlFromPage() {
-    const href = location.href.split("?")[0].split("#")[0];
-    // album/123/track/456 or /track/456
-    if (/\/track\/\d+/i.test(href) || /\/album\/\d+\/track\/\d+/i.test(href)) {
-      return href;
-    }
-    // Player bar sometimes keeps track id in data attributes / canonical
-    const canonical = document.querySelector("link[rel='canonical']")?.href;
-    if (canonical && /music\.yandex\./i.test(canonical) && /\/track\//i.test(canonical)) {
-      return canonical.split("?")[0];
-    }
-    // Fallback: try to build from pathname pieces
-    const m = location.pathname.match(/\/(?:album\/\d+\/)?track\/(\d+)/i);
-    if (m) {
-      return `${location.origin}/track/${m[1]}`;
-    }
-    return href;
+  function trackIdFromText(text) {
+    const m = String(text || "").match(/\/track\/(\d+)/i);
+    return m ? m[1] : null;
   }
 
-  function looksLikeTrackPage() {
-    return /\/track\/\d+/i.test(location.pathname) || /\/album\/\d+\/track\/\d+/i.test(location.pathname);
+  function buildTrackUrl(trackId, albumId) {
+    const origin = location.origin || "https://music.yandex.ru";
+    if (albumId) {
+      return `${origin}/album/${albumId}/track/${trackId}`;
+    }
+    return `${origin}/track/${trackId}`;
+  }
+
+  function normalizeTrackHref(href) {
+    const id = trackIdFromText(href);
+    if (!id) {
+      return null;
+    }
+    const albumMatch = String(href).match(/\/album\/(\d+)/i);
+    return buildTrackUrl(id, albumMatch ? albumMatch[1] : null);
+  }
+
+  function trackUrlFromLocation() {
+    const href = location.href.split("?")[0].split("#")[0];
+    const fromHref = normalizeTrackHref(href);
+    if (fromHref) {
+      return fromHref;
+    }
+
+    const hash = location.hash || "";
+    const fromHash = normalizeTrackHref(hash);
+    if (fromHash) {
+      return fromHash;
+    }
+
+    const canonical = document.querySelector("link[rel='canonical']")?.href;
+    if (canonical) {
+      const fromCanonical = normalizeTrackHref(canonical);
+      if (fromCanonical) {
+        return fromCanonical;
+      }
+    }
+
+    const params = new URLSearchParams(location.search || "");
+    for (const key of ["trackId", "track_id", "track"]) {
+      const raw = params.get(key);
+      if (raw && /^\d+$/.test(raw)) {
+        const albumRaw = params.get("albumId") || params.get("album_id") || params.get("album");
+        const albumId = albumRaw && /^\d+$/.test(albumRaw) ? albumRaw : null;
+        return buildTrackUrl(raw, albumId);
+      }
+    }
+
+    const pathMatch = location.pathname.match(/\/(?:album\/(\d+)\/)?track\/(\d+)/i);
+    if (pathMatch) {
+      return buildTrackUrl(pathMatch[2], pathMatch[1] || null);
+    }
+
+    return null;
+  }
+
+  function trackFromPlayerLinks() {
+    const roots = [
+      document.querySelector("[class*='PlayerBar']"),
+      document.querySelector("[class*='player-controls']"),
+      document.querySelector("[data-testid='player']"),
+      document.querySelector("footer"),
+    ].filter(Boolean);
+
+    const scopes = roots.length ? roots : [document.documentElement];
+    for (const root of scopes) {
+      const links = root.querySelectorAll("a[href*='/track/']");
+      for (const link of links) {
+        const href = link.href || link.getAttribute("href") || "";
+        const url = normalizeTrackHref(href);
+        if (url) {
+          return url;
+        }
+      }
+    }
+
+    const playingLink = document.querySelector(
+      "[class*='playing'] a[href*='/track/'], [class*='Playing'] a[href*='/track/'], [data-testid='track-row'][aria-current='true'] a[href*='/track/']"
+    );
+    if (playingLink) {
+      return normalizeTrackHref(playingLink.href || playingLink.getAttribute("href") || "");
+    }
+
+    return null;
+  }
+
+  function trackFromExternalApi(timeoutMs = 700) {
+    return new Promise((resolve) => {
+      const token = `ts-ym-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      let done = false;
+
+      const finish = (url) => {
+        if (done) {
+          return;
+        }
+        done = true;
+        window.removeEventListener("tubesave-ym-track", onEvent);
+        resolve(url || null);
+      };
+
+      const onEvent = (event) => {
+        const detail = event && event.detail;
+        if (!detail || detail.token !== token) {
+          return;
+        }
+        finish(detail.url || null);
+      };
+
+      window.addEventListener("tubesave-ym-track", onEvent);
+
+      const script = document.createElement("script");
+      script.textContent = `
+        (function () {
+          var url = null;
+          try {
+            var api = window.externalAPI || window.ymPlayerApi;
+            if (api && typeof api.getCurrentTrack === "function") {
+              var track = api.getCurrentTrack();
+              if (track) {
+                var id = track.id || (track.track && track.track.id);
+                var albumId = track.albumId || (track.album && track.album.id);
+                if (id) {
+                  var origin = location.origin || "https://music.yandex.ru";
+                  url = albumId
+                    ? origin + "/album/" + albumId + "/track/" + id
+                    : origin + "/track/" + id;
+                }
+              }
+            }
+          } catch (err) {
+            console.warn("TubeSave YM API", err);
+          }
+          window.dispatchEvent(
+            new CustomEvent("tubesave-ym-track", {
+              detail: { token: "${token}", url: url },
+            })
+          );
+        })();
+      `;
+      (document.documentElement || document.head).appendChild(script);
+      script.remove();
+      setTimeout(() => finish(null), timeoutMs);
+    });
+  }
+
+  async function resolveTrackUrl() {
+    const fromPlayer = trackFromPlayerLinks();
+    if (fromPlayer) {
+      return fromPlayer;
+    }
+    const fromLocation = trackUrlFromLocation();
+    if (fromLocation) {
+      return fromLocation;
+    }
+    return trackFromExternalApi();
+  }
+
+  function stylePanel(btn) {
+    btn.id = PANEL_ID;
+    btn.type = "button";
+    btn.textContent = "↓";
+    btn.title = "Скачать в TubeSave";
+    btn.setAttribute("aria-label", "Скачать в TubeSave");
+    Object.assign(btn.style, {
+      display: "inline-flex",
+      alignItems: "center",
+      justifyContent: "center",
+      flexShrink: "0",
+      width: "36px",
+      height: "36px",
+      margin: "0 2px",
+      padding: "0",
+      border: "none",
+      borderRadius: "50%",
+      cursor: "pointer",
+      fontFamily: "YS Text, Arial, sans-serif",
+      fontSize: "16px",
+      fontWeight: "700",
+      lineHeight: "1",
+      color: "#fff",
+      background: "#2F6FED",
+      boxShadow: "none",
+      userSelect: "none",
+      verticalAlign: "middle",
+    });
   }
 
   function styleInline(btn) {
-    btn.id = BTN_ID;
+    btn.id = PAGE_ID;
     btn.type = "button";
     btn.textContent = "TubeSave";
     btn.title = "Скачать трек в TubeSave (аудио)";
@@ -55,7 +225,7 @@
     btn.id = FLOAT_ID;
     btn.type = "button";
     btn.textContent = "↓ Музыка";
-    btn.title = "Скачать трек в TubeSave";
+    btn.title = "Скачать текущий трек в TubeSave";
     Object.assign(btn.style, {
       position: "fixed",
       right: "18px",
@@ -77,13 +247,27 @@
   }
 
   function flash(btn, text, bg) {
-    const prev = btn.textContent;
-    const prevBg = btn.style.background;
+    const prev = btn.dataset.tsLabel || btn.textContent;
+    const prevBg = btn.dataset.tsBg || btn.style.background;
+    btn.dataset.tsLabel = prev;
+    btn.dataset.tsBg = prevBg;
     btn.textContent = text;
     btn.style.background = bg;
+    if (btn.id === PANEL_ID) {
+      btn.style.width = text.length > 1 ? "auto" : "36px";
+      btn.style.padding = text.length > 1 ? "0 10px" : "0";
+      btn.style.borderRadius = text.length > 1 ? "18px" : "50%";
+      btn.style.fontSize = text.length > 1 ? "11px" : "16px";
+    }
     setTimeout(() => {
       btn.textContent = prev;
       btn.style.background = prevBg;
+      if (btn.id === PANEL_ID) {
+        btn.style.width = "36px";
+        btn.style.padding = "0";
+        btn.style.borderRadius = "50%";
+        btn.style.fontSize = "16px";
+      }
     }, 1400);
   }
 
@@ -92,11 +276,16 @@
     ev.stopPropagation();
     const btn = ev.currentTarget;
     btn.disabled = true;
-    const url = trackUrlFromPage();
+    const url = await resolveTrackUrl();
+    if (!url) {
+      flash(btn, "!", "#B00020");
+      btn.disabled = false;
+      return;
+    }
     if (window.TubeSaveLaunchProtocol) {
       window.TubeSaveLaunchProtocol(url, true, "best");
     }
-    flash(btn, "Запуск…", "#C45C26");
+    flash(btn, "…", "#C45C26");
     try {
       const response = await chrome.runtime.sendMessage({
         type: "tubesave-download",
@@ -105,20 +294,83 @@
         protocol_fired: true,
       });
       if (response && response.ok) {
-        flash(btn, "Отправлено", "#1B7F4B");
+        flash(btn, "✓", "#1B7F4B");
       } else {
-        flash(btn, "Ошибка", "#B00020");
+        flash(btn, "!", "#B00020");
         console.warn(response && response.error);
       }
     } catch (err) {
-      flash(btn, "Ошибка", "#B00020");
+      flash(btn, "!", "#B00020");
       console.warn(err);
     } finally {
       btn.disabled = false;
     }
   }
 
-  function findHost() {
+  function findPlayerBar() {
+    return (
+      document.querySelector("[class*='PlayerBarDesktop']") ||
+      document.querySelector("[class*='PlayerBar']") ||
+      document.querySelector("[class*='player-bar']") ||
+      document.querySelector("[data-testid='player-bar']") ||
+      document.querySelector("[data-testid='player']") ||
+      document.querySelector(".player-controls") ||
+      null
+    );
+  }
+
+  function findPanelActionsHost(bar) {
+    if (!bar) {
+      return null;
+    }
+
+    const byAria = Array.from(
+      bar.querySelectorAll(
+        "button[aria-label], a[aria-label], [role='button'][aria-label]"
+      )
+    ).filter((el) => {
+      const label = (el.getAttribute("aria-label") || "").toLowerCase();
+      return /текст|lyrics|очеред|queue|громк|volume|скач|download|настрой|setting|equaliz|эквал/i.test(
+        label
+      );
+    });
+
+    if (byAria.length) {
+      const parent = byAria[0].parentElement;
+      if (parent) {
+        return parent;
+      }
+    }
+
+    const candidates = Array.from(
+      bar.querySelectorAll("div, section, ul, nav")
+    ).filter((el) => {
+      if (el.closest(`#${PANEL_ID}`)) {
+        return false;
+      }
+      const buttons = el.querySelectorAll("button, [role='button'], a");
+      if (buttons.length < 2 || buttons.length > 10) {
+        return false;
+      }
+      const rect = el.getBoundingClientRect();
+      if (rect.width < 80 || rect.height < 28 || rect.height > 90) {
+        return false;
+      }
+      // Prefer right half of the bar.
+      const barRect = bar.getBoundingClientRect();
+      return rect.left > barRect.left + barRect.width * 0.45;
+    });
+
+    candidates.sort((a, b) => {
+      const ar = a.getBoundingClientRect();
+      const br = b.getBoundingClientRect();
+      return br.left - ar.left || a.querySelectorAll("button").length - b.querySelectorAll("button").length;
+    });
+
+    return candidates[0] || null;
+  }
+
+  function findPageHost() {
     return (
       document.querySelector(".page-track__actions") ||
       document.querySelector("[class*='TrackPage'][class*='Actions'], [class*='TrackPage'] [class*='Actions']") ||
@@ -129,32 +381,80 @@
     );
   }
 
-  function ensureButtons() {
-    if (!looksLikeTrackPage()) {
-      // Still show float on music site so user can grab current player track URL if possible
-      if (!document.getElementById(FLOAT_ID)) {
-        const fab = document.createElement("button");
-        styleFloat(fab);
-        fab.addEventListener("click", onClick);
-        document.documentElement.appendChild(fab);
+  function ensurePanelButton() {
+    const existing = document.getElementById(PANEL_ID);
+    if (existing && existing.isConnected) {
+      return true;
+    }
+    if (existing) {
+      existing.remove();
+    }
+
+    const bar = findPlayerBar();
+    if (!bar) {
+      return false;
+    }
+
+    const host = findPanelActionsHost(bar);
+    const btn = document.createElement("button");
+    stylePanel(btn);
+    btn.addEventListener("click", onClick);
+
+    if (host) {
+      const first = host.firstElementChild;
+      if (first) {
+        host.insertBefore(btn, first);
+      } else {
+        host.appendChild(btn);
       }
+      return true;
+    }
+
+    // Fallback: pin to the right side of the bar itself.
+    Object.assign(btn.style, {
+      position: "absolute",
+      right: "170px",
+      top: "50%",
+      transform: "translateY(-50%)",
+      zIndex: "20",
+    });
+    if (getComputedStyle(bar).position === "static") {
+      bar.style.position = "relative";
+    }
+    bar.appendChild(btn);
+    return true;
+  }
+
+  function ensurePageButton() {
+    const host = findPageHost();
+    if (!host || document.getElementById(PAGE_ID)) {
       return;
     }
+    const btn = document.createElement("button");
+    styleInline(btn);
+    btn.addEventListener("click", onClick);
+    host.appendChild(btn);
+  }
 
-    const host = findHost();
-    if (host && !document.getElementById(BTN_ID)) {
-      const btn = document.createElement("button");
-      styleInline(btn);
-      btn.addEventListener("click", onClick);
-      host.appendChild(btn);
+  function ensureFloatFallback(needFloat) {
+    const existing = document.getElementById(FLOAT_ID);
+    if (!needFloat) {
+      existing?.remove();
+      return;
     }
+    if (existing) {
+      return;
+    }
+    const fab = document.createElement("button");
+    styleFloat(fab);
+    fab.addEventListener("click", onClick);
+    document.documentElement.appendChild(fab);
+  }
 
-    if (!document.getElementById(FLOAT_ID)) {
-      const fab = document.createElement("button");
-      styleFloat(fab);
-      fab.addEventListener("click", onClick);
-      document.documentElement.appendChild(fab);
-    }
+  function ensureButtons() {
+    const onPanel = ensurePanelButton();
+    ensurePageButton();
+    ensureFloatFallback(!onPanel);
   }
 
   ensureButtons();
@@ -165,8 +465,7 @@
   setInterval(() => {
     if (location.href !== lastHref) {
       lastHref = location.href;
-      document.getElementById(BTN_ID)?.remove();
-      // keep float
+      document.getElementById(PAGE_ID)?.remove();
       ensureButtons();
     }
   }, 700);

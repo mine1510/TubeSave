@@ -30,6 +30,20 @@ function isYandexMusic(url) {
   return /music\.yandex\./i.test(hostOf(url));
 }
 
+function yandexTrackId(url) {
+  const text = String(url || "");
+  const pathMatch = text.match(/\/track\/(\d+)/i);
+  if (pathMatch) {
+    return pathMatch[1];
+  }
+  const hashMatch = text.match(/#.*\/track\/(\d+)/i);
+  if (hashMatch) {
+    return hashMatch[1];
+  }
+  const queryMatch = text.match(/(?:[?&])(?:trackId|track_id|track)=(\d+)/i);
+  return queryMatch ? queryMatch[1] : null;
+}
+
 async function yandexCookieHeader() {
   if (!chrome.cookies || !chrome.cookies.getAll) {
     return "";
@@ -171,6 +185,11 @@ async function downloadUrl(
   }
   if (!isSupportedUrl(url)) {
     throw new Error("Сайт не поддерживается TubeSave");
+  }
+  if (isYandexMusic(url) && !yandexTrackId(url)) {
+    throw new Error(
+      "Нужна ссылка на трек (…/track/123). Откройте трек или запустите его в плеере."
+    );
   }
 
   const audio = Boolean(audioOnly) || isYandexMusic(url);

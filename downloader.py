@@ -13,7 +13,7 @@ from pathlib import Path
 from threading import Event
 from typing import Callable
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode, urlparse
+from urllib.parse import parse_qs, urlencode, urlparse
 from urllib.request import Request, urlopen
 
 import yt_dlp
@@ -634,9 +634,22 @@ def _yandex_sign(message: str) -> str:
 
 
 def parse_yandex_track_id(url: str) -> str | None:
-    match = YANDEX_TRACK_RE.search(url or "")
+    text = url or ""
+    match = YANDEX_TRACK_RE.search(text)
     if match:
         return match.group("track")
+    fragment = urlparse(text).fragment or ""
+    hash_match = re.search(r"/track/(?P<track>\d+)", fragment, re.IGNORECASE)
+    if hash_match:
+        return hash_match.group("track")
+    try:
+        query = parse_qs(urlparse(text).query)
+        for key in ("trackId", "track_id", "track"):
+            values = query.get(key) or []
+            if values and re.fullmatch(r"\d+", str(values[0])):
+                return str(values[0])
+    except Exception:
+        pass
     return None
 
 
@@ -765,7 +778,10 @@ def download_yandex_music(
 ) -> Path:
     track_id = parse_yandex_track_id(url)
     if not track_id:
-        raise ValueError("Нужна ссылка на трек Яндекс.Музыки (…/track/123).")
+        raise ValueError(
+            "Нужна ссылка на трек Яндекс.Музыки (…/track/123).\n"
+            "Откройте страницу трека или запустите его в плеере и нажмите «Скачать» снова."
+        )
 
     def report(message: str) -> None:
         _check_cancel(cancel_event)
