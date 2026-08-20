@@ -844,6 +844,33 @@ def download_yandex_music(
         raise
 
 
+def _youtube_needs_client_fallback(message: str) -> bool:
+    lower = (message or "").lower()
+    return any(
+        needle in lower
+        for needle in (
+            "403",
+            "forbidden",
+            "not available",
+            "requested format is not available",
+            "sign in to confirm",
+            "confirm you're not a bot",
+            "private video",
+            "login required",
+        )
+    )
+
+
+def _with_youtube_android_clients(opts: dict) -> dict:
+    fallback = dict(opts)
+    extractor_args = dict(fallback.get("extractor_args") or {})
+    youtube_args = dict(extractor_args.get("youtube") or {})
+    youtube_args["player_client"] = ["android", "android_sdkless", "ios", "mweb"]
+    extractor_args["youtube"] = youtube_args
+    fallback["extractor_args"] = extractor_args
+    return fallback
+
+
 def download_video(
     url: str,
     output_dir: Path,
@@ -910,18 +937,22 @@ def download_video(
                     raise DownloadCancelled("Загрузка отменена") from None
                 last_error = exc
                 message = str(exc)
-                # Retry only for transient CDN blocks; other errors fail fast.
+                # Retry only for transient CDN / player-client blocks.
+                if site == "youtube":
+                    if not _youtube_needs_client_fallback(message):
+                        raise
+                    # Player-client blocks won't fix themselves — fall through to android.
+                    break
                 if "403" not in message and "Forbidden" not in message:
                     raise
+                # Keep retrying 403 a few times before the android fallback.
 
         if filepath is None:
             report("Обход блокировки…")
             fallback = dict(opts)
             fallback["format"] = fallback_format_selector(audio_only=audio_only, quality=quality)
             if site == "youtube":
-                fallback["extractor_args"] = {
-                    "youtube": {"player_client": ["android", "android_sdkless"]},
-                }
+                fallback = _with_youtube_android_clients(fallback)
             try:
                 filepath = _try_download(
                     url, fallback, report, audio_only=audio_only, cancel_event=cancel_event

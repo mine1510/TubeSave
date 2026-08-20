@@ -1,7 +1,10 @@
 (() => {
   const PANEL_ID = "tubesave-ym-panel";
+  const WRAP_ID = "tubesave-ym-panel-wrap";
   const PAGE_ID = "tubesave-ym-btn";
   const FLOAT_ID = "tubesave-ym-float";
+  let panelWrap = null;
+  let panelBtn = null;
 
   function trackIdFromText(text) {
     const m = String(text || "").match(/\/track\/(\d+)/i);
@@ -178,7 +181,7 @@
       flexShrink: "0",
       width: "36px",
       height: "36px",
-      margin: "0 2px",
+      margin: "0",
       padding: "0",
       border: "none",
       borderRadius: "50%",
@@ -189,9 +192,106 @@
       lineHeight: "1",
       color: "#fff",
       background: "#2F6FED",
-      boxShadow: "none",
+      boxShadow: "0 2px 8px rgba(0,0,0,.35)",
       userSelect: "none",
       verticalAlign: "middle",
+      pointerEvents: "auto",
+      position: "relative",
+      zIndex: "2147483647",
+      touchAction: "manipulation",
+    });
+  }
+
+  function createPanelWrap() {
+    const wrap = document.createElement("div");
+    wrap.id = WRAP_ID;
+    Object.assign(wrap.style, {
+      position: "fixed",
+      zIndex: "2147483647",
+      display: "none",
+      alignItems: "center",
+      justifyContent: "center",
+      width: "36px",
+      height: "36px",
+      pointerEvents: "auto",
+      margin: "0",
+      padding: "0",
+      border: "none",
+      background: "transparent",
+    });
+
+    const btn = document.createElement("button");
+    stylePanel(btn);
+    btn.addEventListener("click", onClick, true);
+    btn.addEventListener("mousedown", (ev) => ev.stopPropagation(), true);
+    btn.addEventListener("pointerdown", (ev) => ev.stopPropagation(), true);
+    wrap.appendChild(btn);
+    document.documentElement.appendChild(wrap);
+    panelWrap = wrap;
+    panelBtn = btn;
+    return wrap;
+  }
+
+  function findPanelAnchor() {
+    const bar = findPlayerBar();
+    if (!bar) {
+      return null;
+    }
+
+    const download = bar.querySelector(
+      "button[aria-label*='Скачать'], button[aria-label*='Download'], button[aria-label*='download']"
+    );
+    if (download) {
+      const rect = download.getBoundingClientRect();
+      if (rect.width > 0 && rect.height > 0) {
+        return {
+          left: rect.left - 42,
+          top: rect.top + (rect.height - 36) / 2,
+        };
+      }
+    }
+
+    const host = findPanelActionsHost(bar);
+    if (host) {
+      const rect = host.getBoundingClientRect();
+      if (rect.width > 0 && rect.height > 0) {
+        return {
+          left: rect.left - 6,
+          top: rect.top + (rect.height - 36) / 2,
+        };
+      }
+    }
+
+    const barRect = bar.getBoundingClientRect();
+    if (barRect.width > 0 && barRect.height > 0) {
+      return {
+        left: barRect.right - 210,
+        top: barRect.top + (barRect.height - 36) / 2,
+      };
+    }
+    return null;
+  }
+
+  function positionPanelWrap() {
+    if (!panelWrap) {
+      return false;
+    }
+    const anchor = findPanelAnchor();
+    if (!anchor) {
+      panelWrap.style.display = "none";
+      return false;
+    }
+    panelWrap.style.display = "flex";
+    panelWrap.style.left = `${Math.round(anchor.left)}px`;
+    panelWrap.style.top = `${Math.round(anchor.top)}px`;
+    return true;
+  }
+
+  function removeLegacyPanelNodes() {
+    document.querySelectorAll(`#${PANEL_ID}`).forEach((node) => {
+      if (!panelWrap || !panelWrap.contains(node)) {
+        node.remove();
+      }
     });
   }
 
@@ -382,47 +482,11 @@
   }
 
   function ensurePanelButton() {
-    const existing = document.getElementById(PANEL_ID);
-    if (existing && existing.isConnected) {
-      return true;
+    removeLegacyPanelNodes();
+    if (!panelWrap || !panelWrap.isConnected) {
+      createPanelWrap();
     }
-    if (existing) {
-      existing.remove();
-    }
-
-    const bar = findPlayerBar();
-    if (!bar) {
-      return false;
-    }
-
-    const host = findPanelActionsHost(bar);
-    const btn = document.createElement("button");
-    stylePanel(btn);
-    btn.addEventListener("click", onClick);
-
-    if (host) {
-      const first = host.firstElementChild;
-      if (first) {
-        host.insertBefore(btn, first);
-      } else {
-        host.appendChild(btn);
-      }
-      return true;
-    }
-
-    // Fallback: pin to the right side of the bar itself.
-    Object.assign(btn.style, {
-      position: "absolute",
-      right: "170px",
-      top: "50%",
-      transform: "translateY(-50%)",
-      zIndex: "20",
-    });
-    if (getComputedStyle(bar).position === "static") {
-      bar.style.position = "relative";
-    }
-    bar.appendChild(btn);
-    return true;
+    return positionPanelWrap();
   }
 
   function ensurePageButton() {
@@ -460,6 +524,10 @@
   ensureButtons();
   const observer = new MutationObserver(() => ensureButtons());
   observer.observe(document.documentElement, { childList: true, subtree: true });
+
+  window.addEventListener("scroll", () => positionPanelWrap(), true);
+  window.addEventListener("resize", () => positionPanelWrap());
+  setInterval(() => positionPanelWrap(), 500);
 
   let lastHref = location.href;
   setInterval(() => {
