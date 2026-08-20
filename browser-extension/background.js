@@ -6,6 +6,8 @@ const SUPPORTED = [
   /(?:^|\.)vk\.com$/i,
   /(?:^|\.)vkvideo\.ru$/i,
   /(?:^|\.)pornhub\.com$/i,
+  /(?:^|\.)pornhub\.org$/i,
+  /(?:^|\.)pornhub\.net$/i,
   /(?:^|\.)iwara\.tv$/i,
   /(?:^|\.)rule34\.xxx$/i,
   /(?:^|\.)rule34video\.com$/i,

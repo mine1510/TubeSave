@@ -161,7 +161,7 @@ SITE_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     (
         "pornhub",
         re.compile(
-            r"^https?://(?:[\w-]+\.)?pornhub\.com/",
+            r"^https?://(?:[\w-]+\.)?pornhub\.(?:com|org|net)/",
             re.IGNORECASE,
         ),
     ),
@@ -182,7 +182,7 @@ SUPPORTED_SITES_HINT = (
     "music.yandex.ru\n"
     "rule34.xxx / rule34video.com\n"
     "iwara.tv\n"
-    "pornhub.com"
+    "pornhub.com / pornhub.org"
 )
 
 YANDEX_TRACK_RE = re.compile(
@@ -216,7 +216,7 @@ def detect_site(url: str) -> str | None:
         return "rule34"
     if host.endswith("iwara.tv"):
         return "iwara"
-    if host.endswith("pornhub.com"):
+    if host.endswith("pornhub.com") or host.endswith("pornhub.org") or host.endswith("pornhub.net"):
         return "pornhub"
     return None
 

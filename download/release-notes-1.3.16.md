@@ -1,0 +1,3 @@
+Ссылки PornHub на pornhub.org и pornhub.net больше не отклоняются как неподдерживаемые.
+
+Работает, в том числе, rt.pornhub.org/view_video.php?viewkey=…

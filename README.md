@@ -44,7 +44,7 @@
 - Яндекс.Музыка — `music.yandex.ru` (аудио)
 - Rule34 — `rule34.xxx`, `rule34video.com`
 - Iwara — `iwara.tv`
-- PornHub — `pornhub.com`
+- PornHub — `pornhub.com` / `pornhub.org`
 
 ## Возможности
 
