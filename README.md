@@ -40,7 +40,7 @@
 Поддерживаемые сайты:
 
 - YouTube — `youtube.com`, `youtu.be`, Shorts
-- VK Video — `vkvideo.ru`, `vk.com` (видео и клипы)
+- VK Video — `vkvideo.ru`, `vk.com`, `vk.ru` (видео и клипы)
 - Яндекс.Музыка — `music.yandex.ru` (аудио)
 - Rule34 — `rule34.xxx`, `rule34video.com`
 - Iwara — `iwara.tv`

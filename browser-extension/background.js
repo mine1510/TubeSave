@@ -4,6 +4,7 @@ const SUPPORTED = [
   /(?:^|\.)youtube\.com$/i,
   /^youtu\.be$/i,
   /(?:^|\.)vk\.com$/i,
+  /(?:^|\.)vk\.ru$/i,
   /(?:^|\.)vkvideo\.ru$/i,
   /(?:^|\.)pornhub\.com$/i,
   /(?:^|\.)pornhub\.org$/i,

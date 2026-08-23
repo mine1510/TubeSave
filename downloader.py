@@ -133,7 +133,7 @@ SITE_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     (
         "vk",
         re.compile(
-            r"^https?://(?:(?:www|m)\.)?(?:vk\.com|vkvideo\.ru)/",
+            r"^https?://(?:(?:www|m)\.)?(?:vk\.com|vk\.ru|vkvideo\.ru)/",
             re.IGNORECASE,
         ),
     ),
@@ -178,7 +178,7 @@ SITE_LABELS = {
 
 SUPPORTED_SITES_HINT = (
     "youtube.com / youtu.be / shorts\n"
-    "vkvideo.ru / vk.com (видео и клипы)\n"
+    "vkvideo.ru / vk.com / vk.ru (видео и клипы)\n"
     "music.yandex.ru\n"
     "rule34.xxx / rule34video.com\n"
     "iwara.tv\n"
@@ -208,7 +208,7 @@ def detect_site(url: str) -> str | None:
         return None
     if host.endswith("youtube.com") or host == "youtu.be":
         return "youtube"
-    if host.endswith("vk.com") or host.endswith("vkvideo.ru"):
+    if host.endswith("vk.com") or host.endswith("vk.ru") or host.endswith("vkvideo.ru"):
         return "vk"
     if "music.yandex." in host:
         return "yandexmusic"

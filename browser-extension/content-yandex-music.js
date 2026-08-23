@@ -156,6 +156,76 @@
     });
   }
 
+  function looksLikeTrackPage() {
+    return Boolean(trackUrlFromLocation());
+  }
+
+  function isMyWavePage() {
+    if (looksLikeTrackPage()) {
+      return false;
+    }
+
+    const path = (location.pathname || "/").replace(/\/+$/, "") || "/";
+    if (/^\/(?:radio|rotor|station)(?:\/|$)/i.test(path)) {
+      return true;
+    }
+
+    if (path !== "/" && path !== "/home") {
+      return false;
+    }
+
+    const waveTitles = Array.from(
+      document.querySelectorAll("span, div, p, a, button, h1, h2, h3")
+    ).filter((el) => {
+      const text = (el.textContent || "").trim();
+      if (text !== "Моя волна" && text !== "My wave") {
+        return false;
+      }
+      const rect = el.getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0) {
+        return false;
+      }
+      // Title sits in the center player, not in the left sidebar list.
+      return rect.left > window.innerWidth * 0.22 && rect.top < window.innerHeight * 0.42;
+    });
+    if (waveTitles.length) {
+      return true;
+    }
+
+    return Boolean(
+      document.querySelector(
+        "[class*='Rotor'], [class*='WavePage'], [class*='StationPage'], [class*='MyWave']"
+      )
+    );
+  }
+
+  function myWaveCornerOffset() {
+    const bar = findPlayerBar();
+    if (!bar) {
+      return 20;
+    }
+    const rect = bar.getBoundingClientRect();
+    if (rect.width > 0 && rect.height > 0 && rect.bottom >= window.innerHeight - 12) {
+      return Math.max(20, Math.round(window.innerHeight - rect.top + 14));
+    }
+    return 20;
+  }
+
+  function applyCornerPosition(wrap) {
+    wrap.style.display = "flex";
+    wrap.style.left = "auto";
+    wrap.style.top = "auto";
+    wrap.style.right = "20px";
+    wrap.style.bottom = `${myWaveCornerOffset()}px`;
+  }
+
+  function applyAnchorPosition(wrap, anchor) {
+    wrap.style.right = "auto";
+    wrap.style.bottom = "auto";
+    wrap.style.display = "flex";
+    wrap.style.left = `${Math.round(anchor.left)}px`;
+    wrap.style.top = `${Math.round(anchor.top)}px`;
+  }
   async function resolveTrackUrl() {
     const fromPlayer = trackFromPlayerLinks();
     if (fromPlayer) {
@@ -276,14 +346,16 @@
     if (!panelWrap) {
       return false;
     }
+    if (isMyWavePage()) {
+      applyCornerPosition(panelWrap);
+      return true;
+    }
     const anchor = findPanelAnchor();
     if (!anchor) {
       panelWrap.style.display = "none";
       return false;
     }
-    panelWrap.style.display = "flex";
-    panelWrap.style.left = `${Math.round(anchor.left)}px`;
-    panelWrap.style.top = `${Math.round(anchor.top)}px`;
+    applyAnchorPosition(panelWrap, anchor);
     return true;
   }
 
@@ -502,7 +574,7 @@
 
   function ensureFloatFallback(needFloat) {
     const existing = document.getElementById(FLOAT_ID);
-    if (!needFloat) {
+    if (!needFloat || isMyWavePage()) {
       existing?.remove();
       return;
     }
