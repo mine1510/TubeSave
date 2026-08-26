@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 import hashlib
 import hmac
 import json
@@ -14,7 +15,7 @@ import time
 from http.cookiejar import Cookie
 from pathlib import Path
 from threading import Event
-from typing import Callable
+from typing import Callable, Iterator
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlencode, urlparse
 from urllib.request import Request, urlopen
@@ -245,6 +246,98 @@ def get_ffmpeg_location() -> str:
     return imageio_ffmpeg.get_ffmpeg_exe()
 
 
+_PROXY_ENV_KEYS = (
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "no_proxy",
+    "NO_PROXY",
+)
+
+
+@contextlib.contextmanager
+def _without_process_proxy_env() -> Iterator[None]:
+    """
+    Prevent curl_cffi from using a broken local/system proxy.
+
+    On Windows, libcurl auto-detects the IE/WinHTTP proxy (often 127.0.0.1 from
+    Clash/V2Ray). Clearing proxy env vars alone is not enough — NO_PROXY=* forces
+    a direct connection for every host.
+    """
+    saved = {key: os.environ[key] for key in _PROXY_ENV_KEYS if key in os.environ}
+    try:
+        for key in ("http_proxy", "https_proxy", "all_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
+            os.environ.pop(key, None)
+        os.environ["NO_PROXY"] = "*"
+        os.environ["no_proxy"] = "*"
+        yield
+    finally:
+        for key in _PROXY_ENV_KEYS:
+            os.environ.pop(key, None)
+        os.environ.update(saved)
+
+
+def _apply_direct_network(opts: dict) -> dict:
+    """Force a direct connection so a broken local proxy (127.0.0.1) cannot break downloads."""
+    # Empty string = no proxy in yt-dlp (None would fall back to env/system proxy).
+    opts["proxy"] = ""
+    return opts
+
+
+def _force_ydl_direct_proxies(ydl: yt_dlp.YoutubeDL) -> None:
+    """
+    Make curl_cffi skip Windows system proxy auto-detect.
+
+    yt-dlp's proxy="" becomes all=None and leaves CURLOPT_PROXY unset, so libcurl
+    still picks IE/WinHTTP proxy (often 127.0.0.1). Setting no='*' maps to
+    CURLOPT_NOPROXY=* and disables every proxy.
+    """
+    ydl.__dict__["proxies"] = {"all": None, "no": "*"}
+
+
+@contextlib.contextmanager
+def _youtube_dl(opts: dict) -> Iterator[yt_dlp.YoutubeDL]:
+    _apply_direct_network(opts)
+    with _without_process_proxy_env():
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            _force_ydl_direct_proxies(ydl)
+            yield ydl
+
+
+def _is_proxy_error(message: str) -> bool:
+    lower = (message or "").lower()
+    return any(
+        needle in lower
+        for needle in (
+            "proxyerror",
+            "could not resolve proxy",
+            "failed to perform, curl: (97)",
+            "failed to perform, curl: (7)",
+            "curl: (97)",
+            "could not resolve proxy: 127.0.0.1",
+            "tunnel connection failed",
+            "proxy connect aborted",
+            "407 proxy",
+            "resolve proxy",
+        )
+    )
+
+
+def _proxy_error() -> RuntimeError:
+    return RuntimeError(
+        "Сетевая ошибка: TubeSave пытался ходить через локальный прокси "
+        "(часто 127.0.0.1 — Clash / V2Ray / VPN), но прокси недоступен.\n\n"
+        "Что сделать:\n"
+        "1. Включите прокси/VPN, если он должен быть запущен, или\n"
+        "2. Выключите системный прокси в Windows "
+        "(Параметры → Сеть и Интернет → Прокси) и в клиенте Clash/V2Ray.\n"
+        "3. Перезапустите TubeSave и скачайте снова."
+    )
+
+
 def get_impersonate_target():
     """Pick a curl_cffi browser profile that yt-dlp can actually use."""
     global _IMPERSONATE_TARGET
@@ -260,8 +353,14 @@ def get_impersonate_target():
         ImpersonateTarget("edge", "101", "windows", "10"),
         ImpersonateTarget("chrome", "99", "windows", "10"),
     ]
-    probe = yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True, **_ydl_storage_opts()})
-    available = [target for target, _source in probe._get_available_impersonate_targets()]
+    with _without_process_proxy_env():
+        probe = yt_dlp.YoutubeDL(
+            _apply_direct_network(
+                {"quiet": True, "no_warnings": True, **_ydl_storage_opts()}
+            )
+        )
+        _force_ydl_direct_proxies(probe)
+        available = [target for target, _source in probe._get_available_impersonate_targets()]
     for target in preferred:
         if any(target in item or item in target for item in available):
             _IMPERSONATE_TARGET = target
@@ -744,8 +843,17 @@ def _youtube_bot_error() -> RuntimeError:
 
 def _reraise_youtube_error(exc: Exception) -> None:
     message = str(exc)
+    if _is_proxy_error(message):
+        raise _proxy_error() from None
     if _is_youtube_bot_check(message):
         raise _youtube_bot_error() from None
+    raise exc
+
+
+def _reraise_download_error(exc: Exception) -> None:
+    message = str(exc)
+    if _is_proxy_error(message):
+        raise _proxy_error() from None
     raise exc
 
 
@@ -851,7 +959,7 @@ def build_ydl_opts(
     if postprocessor_hooks:
         opts["postprocessor_hooks"] = postprocessor_hooks
 
-    return opts
+    return _apply_direct_network(opts)
 
 
 def fetch_video_info(
@@ -883,13 +991,28 @@ def fetch_video_info(
         _apply_youtube_cookies(opts, _ensure_youtube_cookiefile(cookies))
     if cancel_event is not None:
         opts["progress_hooks"] = [lambda data: _abort_if_cancelled(data, cancel_event)]
+    _apply_direct_network(opts)
     try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
+        with _youtube_dl(opts) as ydl:
             info = ydl.extract_info(url, download=False)
     except Exception as exc:
-        if site == "youtube":
+        if _is_proxy_error(str(exc)):
+            # Retry without browser impersonation (urllib path respects proxy="").
+            retry_opts = dict(opts)
+            retry_opts.pop("impersonate", None)
+            try:
+                with _youtube_dl(retry_opts) as ydl:
+                    info = ydl.extract_info(url, download=False)
+            except Exception as retry_exc:
+                if _is_proxy_error(str(retry_exc)):
+                    raise _proxy_error() from None
+                if site == "youtube":
+                    _reraise_youtube_error(retry_exc)
+                raise
+        elif site == "youtube":
             _reraise_youtube_error(exc)
-        raise
+        else:
+            raise
     _check_cancel(cancel_event)
     if info is None:
         raise RuntimeError("Не удалось получить информацию о видео.")
@@ -938,12 +1061,33 @@ def _try_download(
     _check_cancel(cancel_event)
     if report is not None:
         report("Получение информации о видео…")
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        _check_cancel(cancel_event)
-        if info is None:
-            raise RuntimeError("Не удалось получить информацию о видео.")
-        return _resolve_output_path(ydl, info, audio_only=audio_only)
+    try:
+        with _youtube_dl(opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            _check_cancel(cancel_event)
+            if info is None:
+                raise RuntimeError("Не удалось получить информацию о видео.")
+            return _resolve_output_path(ydl, info, audio_only=audio_only)
+    except DownloadCancelled:
+        raise
+    except Exception as exc:
+        if _is_proxy_error(str(exc)) and opts.get("impersonate") is not None:
+            retry_opts = dict(opts)
+            retry_opts.pop("impersonate", None)
+            try:
+                with _youtube_dl(retry_opts) as ydl:
+                    info = ydl.extract_info(url, download=True)
+                    _check_cancel(cancel_event)
+                    if info is None:
+                        raise RuntimeError("Не удалось получить информацию о видео.")
+                    return _resolve_output_path(ydl, info, audio_only=audio_only)
+            except DownloadCancelled:
+                raise
+            except Exception as retry_exc:
+                _reraise_download_error(retry_exc)
+                raise
+        _reraise_download_error(exc)
+        raise
 
 
 def _safe_filename(text: str) -> str:
