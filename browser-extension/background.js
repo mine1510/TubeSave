@@ -33,6 +33,11 @@ function isYandexMusic(url) {
   return /music\.yandex\./i.test(hostOf(url));
 }
 
+function isYouTube(url) {
+  const host = hostOf(url);
+  return /(?:^|\.)youtube\.com$/i.test(host) || /^youtu\.be$/i.test(host);
+}
+
 function yandexTrackId(url) {
   const text = String(url || "");
   const pathMatch = text.match(/\/track\/(\d+)/i);
@@ -82,6 +87,52 @@ async function yandexCookieHeader() {
   }
 }
 
+async function youtubeCookiePayload() {
+  if (!chrome.cookies || !chrome.cookies.getAll) {
+    return "";
+  }
+  try {
+    const groups = await Promise.allSettled([
+      chrome.cookies.getAll({ domain: "youtube.com" }),
+      chrome.cookies.getAll({ domain: "youtu.be" }),
+      chrome.cookies.getAll({ domain: "google.com" }),
+    ]);
+    const wantedGoogle = /^(SID|HSID|SSID|APISID|SAPISID|__Secure-|SIDCC|LOGIN_INFO)/i;
+    const seen = new Set();
+    const list = [];
+    for (const result of groups) {
+      if (result.status !== "fulfilled" || !Array.isArray(result.value)) {
+        continue;
+      }
+      for (const cookie of result.value) {
+        if (!cookie || !cookie.name) {
+          continue;
+        }
+        const domain = String(cookie.domain || "");
+        if (/google\.com$/i.test(domain.replace(/^\./, "")) && !wantedGoogle.test(cookie.name)) {
+          continue;
+        }
+        const key = `${domain}|${cookie.name}|${cookie.path || "/"}`;
+        if (seen.has(key)) {
+          continue;
+        }
+        seen.add(key);
+        list.push({
+          name: cookie.name,
+          value: cookie.value,
+          domain: cookie.domain,
+          path: cookie.path || "/",
+          secure: Boolean(cookie.secure),
+          expirationDate: cookie.expirationDate || 0,
+        });
+      }
+    }
+    return list.length ? JSON.stringify(list) : "";
+  } catch {
+    return "";
+  }
+}
+
 async function pingBridge() {
   try {
     const res = await fetch(`${BRIDGE}/ping`, { method: "GET", cache: "no-store" });
@@ -94,7 +145,11 @@ async function pingBridge() {
 }
 
 async function sendToApp(url, autoStart = true, audioOnly = false, quality = "best") {
-  const cookies = isYandexMusic(url) ? await yandexCookieHeader() : "";
+  const cookies = isYandexMusic(url)
+    ? await yandexCookieHeader()
+    : isYouTube(url)
+      ? await youtubeCookiePayload()
+      : "";
   const res = await fetch(`${BRIDGE}/download`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },

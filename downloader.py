@@ -6,9 +6,12 @@ import base64
 import hashlib
 import hmac
 import json
+import os
 import re
+import shutil
 import subprocess
 import time
+from http.cookiejar import Cookie
 from pathlib import Path
 from threading import Event
 from typing import Callable
@@ -419,6 +422,333 @@ def _ydl_storage_opts() -> dict:
     }
 
 
+def _ydl_js_runtimes() -> dict:
+    """Enable a local JS runtime so YouTube web clients can solve challenges."""
+    try:
+        from yt_dlp.globals import supported_js_runtimes
+
+        known = set(supported_js_runtimes.value or {})
+    except Exception:
+        return {}
+    runtimes: dict = {}
+    if "node" in known and shutil.which("node"):
+        runtimes["node"] = {}
+    if "deno" in known and shutil.which("deno"):
+        runtimes["deno"] = {}
+    return runtimes
+
+
+class _QuietCookieLogger:
+    def debug(self, *args, **kwargs) -> None:
+        return
+
+    def info(self, *args, **kwargs) -> None:
+        return
+
+    def warning(self, *args, **kwargs) -> None:
+        return
+
+    def error(self, *args, **kwargs) -> None:
+        return
+
+
+_YOUTUBE_AUTH_NAMES = {
+    "LOGIN_INFO",
+    "SAPISID",
+    "__Secure-1PAPISID",
+    "__Secure-3PAPISID",
+}
+_YOUTUBE_SESSION_NAMES = _YOUTUBE_AUTH_NAMES | {
+    "SID",
+    "HSID",
+    "SSID",
+    "APISID",
+    "__Secure-1PSID",
+    "__Secure-3PSID",
+    "VISITOR_INFO1_LIVE",
+    "VISITOR_PRIVACY_METADATA",
+    "__Secure-YEC",
+    "PREF",
+    "SOCS",
+    "CONSENT",
+}
+_BROWSER_COOKIES_TRIED = False
+
+
+def _youtube_cookie_file() -> Path:
+    from bridge import user_data_dir
+
+    folder = user_data_dir()
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder / "youtube-cookies.txt"
+
+
+def _cookie_names_from_file(path: Path) -> set[str]:
+    names: set[str] = set()
+    if not path.is_file():
+        return names
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return names
+    for line in text.splitlines():
+        if line.startswith("#HttpOnly_"):
+            line = line[len("#HttpOnly_"):]
+        elif not line or line.startswith("#"):
+            continue
+        parts = line.split("\t")
+        if len(parts) >= 7:
+            names.add(parts[5])
+    return names
+
+
+def _cookie_file_has_youtube_session(path: Path) -> bool:
+    names = _cookie_names_from_file(path)
+    return bool(names & _YOUTUBE_SESSION_NAMES)
+
+
+def _cookie_file_has_youtube_auth(path: Path) -> bool:
+    names = _cookie_names_from_file(path)
+    return "LOGIN_INFO" in names and bool(
+        names & {"SAPISID", "__Secure-1PAPISID", "__Secure-3PAPISID"}
+    )
+
+
+def _looks_like_youtube_cookies(raw: str) -> bool:
+    text = (raw or "").strip()
+    if not text:
+        return False
+    if text.startswith("["):
+        lower = text.lower()
+        return "youtube" in lower or "login_info" in lower or "sapisid" in lower
+    return any(name in text for name in _YOUTUBE_SESSION_NAMES) or "SID=" in text
+
+
+def _add_cookie_to_jar(jar, *, name: str, value: str, domain: str, path: str, secure: bool, expires) -> None:
+    host = (domain or ".youtube.com").strip() or ".youtube.com"
+    if host.startswith("."):
+        cookie_domain = host
+        domain_initial_dot = True
+    else:
+        cookie_domain = host
+        domain_initial_dot = False
+    expiry = None
+    if expires not in (None, "", 0, "0"):
+        try:
+            expiry = int(float(expires))
+        except (TypeError, ValueError):
+            expiry = None
+    jar.set_cookie(
+        Cookie(
+            0,
+            name,
+            value,
+            None,
+            False,
+            cookie_domain,
+            True,
+            domain_initial_dot,
+            path or "/",
+            True,
+            bool(secure) or name.startswith("__Secure-") or name.startswith("__Host-"),
+            expiry,
+            expiry is None,
+            None,
+            None,
+            {},
+        )
+    )
+
+
+def _cookies_payload_to_jar(raw: str):
+    from yt_dlp.cookies import YoutubeDLCookieJar
+
+    jar = YoutubeDLCookieJar()
+    text = (raw or "").strip()
+    if not text:
+        return jar
+    if text.startswith("["):
+        try:
+            items = json.loads(text)
+        except json.JSONDecodeError:
+            items = []
+        if isinstance(items, list):
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                name = str(item.get("name") or "").strip()
+                value = str(item.get("value") or "")
+                if not name:
+                    continue
+                _add_cookie_to_jar(
+                    jar,
+                    name=name,
+                    value=value,
+                    domain=str(item.get("domain") or ".youtube.com"),
+                    path=str(item.get("path") or "/"),
+                    secure=bool(item.get("secure")),
+                    expires=item.get("expirationDate") or item.get("expires"),
+                )
+            return jar
+    if "\t" in text or text.startswith("# Netscape"):
+        dest = _youtube_cookie_file()
+        body = text if text.lstrip().startswith("#") else "# Netscape HTTP Cookie File\n" + text
+        try:
+            dest.write_text(body, encoding="utf-8")
+            loaded = YoutubeDLCookieJar(str(dest))
+            loaded.load(ignore_discard=True, ignore_expires=True)
+            return loaded
+        except Exception:
+            pass
+    for part in text.split(";"):
+        piece = part.strip()
+        if "=" not in piece:
+            continue
+        name, value = piece.split("=", 1)
+        name = name.strip()
+        if not name:
+            continue
+        _add_cookie_to_jar(
+            jar,
+            name=name,
+            value=value.strip(),
+            domain=".youtube.com",
+            path="/",
+            secure=name.startswith("__Secure-") or name.startswith("__Host-"),
+            expires=None,
+        )
+    return jar
+
+
+def _save_cookie_jar(jar, path: Path) -> bool:
+    if jar is None or len(jar) == 0:
+        return False
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        jar.save(filename=str(path), ignore_discard=True, ignore_expires=True)
+        return path.is_file() and path.stat().st_size > 0
+    except OSError:
+        return False
+
+
+def _browser_cookie_specs() -> list[tuple[str, str | None, str]]:
+    specs: list[tuple[str, str | None, str]] = [
+        ("firefox", None, "Firefox"),
+        ("edge", None, "Edge"),
+        ("chrome", None, "Chrome"),
+        ("opera", None, "Opera"),
+        ("brave", None, "Brave"),
+        ("vivaldi", None, "Vivaldi"),
+    ]
+    local = Path(os.environ.get("LOCALAPPDATA", "") or "")
+    yandex = local / "Yandex" / "YandexBrowser" / "User Data"
+    if yandex.is_dir():
+        specs.insert(1, ("chrome", str(yandex), "Яндекс.Браузер"))
+    return specs
+
+
+def _browser_profile_exists(browser: str, profile: str | None) -> bool:
+    if profile:
+        return Path(profile).exists()
+    local = Path(os.environ.get("LOCALAPPDATA", "") or "")
+    roaming = Path(os.environ.get("APPDATA", "") or "")
+    known = {
+        "firefox": roaming / "Mozilla" / "Firefox" / "Profiles",
+        "edge": local / "Microsoft" / "Edge" / "User Data",
+        "chrome": local / "Google" / "Chrome" / "User Data",
+        "opera": roaming / "Opera Software" / "Opera Stable",
+        "brave": local / "BraveSoftware" / "Brave-Browser" / "User Data",
+        "vivaldi": local / "Vivaldi" / "User Data",
+    }
+    path = known.get(browser)
+    return bool(path and path.exists())
+
+
+def _extract_youtube_cookies_from_browsers(
+    report: Callable[[str], None] | None = None,
+    *,
+    force: bool = False,
+) -> bool:
+    global _BROWSER_COOKIES_TRIED
+    dest = _youtube_cookie_file()
+    if _BROWSER_COOKIES_TRIED and not force:
+        return _cookie_file_has_youtube_session(dest)
+    _BROWSER_COOKIES_TRIED = True
+    try:
+        from yt_dlp.cookies import extract_cookies_from_browser
+    except Exception:
+        return False
+    logger = _QuietCookieLogger()
+    if report is not None:
+        report("Чтение cookies браузера…")
+    for browser, profile, _label in _browser_cookie_specs():
+        if not _browser_profile_exists(browser, profile):
+            continue
+        try:
+            jar = extract_cookies_from_browser(browser, profile, logger)
+        except Exception:
+            continue
+        names = {cookie.name for cookie in jar if cookie.value}
+        if not (names & _YOUTUBE_SESSION_NAMES):
+            continue
+        if _save_cookie_jar(jar, dest):
+            return True
+    return _cookie_file_has_youtube_session(dest)
+
+
+def _import_youtube_cookie_payload(raw: str) -> bool:
+    if not _looks_like_youtube_cookies(raw):
+        return False
+    jar = _cookies_payload_to_jar(raw)
+    return _save_cookie_jar(jar, _youtube_cookie_file())
+
+
+def _ensure_youtube_cookiefile(
+    cookies: str = "",
+    report: Callable[[str], None] | None = None,
+    *,
+    refresh_from_browser: bool = False,
+) -> Path | None:
+    dest = _youtube_cookie_file()
+    imported = _import_youtube_cookie_payload(cookies)
+    if imported and _cookie_file_has_youtube_session(dest):
+        if report is not None:
+            report("Сессия YouTube из браузера…")
+        return dest
+    if not refresh_from_browser and _cookie_file_has_youtube_session(dest):
+        return dest
+    if _extract_youtube_cookies_from_browsers(report, force=refresh_from_browser) and _cookie_file_has_youtube_session(dest):
+        return dest
+    if dest.is_file() and dest.stat().st_size > 0:
+        return dest
+    return None
+
+
+def _apply_youtube_cookies(opts: dict, cookie_file: Path | None) -> dict:
+    if cookie_file is None:
+        return opts
+    opts["cookiefile"] = str(cookie_file)
+    return opts
+
+
+def _youtube_bot_error() -> RuntimeError:
+    return RuntimeError(
+        "YouTube просит подтвердить, что вы не бот.\n\n"
+        "1. Откройте это видео в браузере и войдите в аккаунт Google.\n"
+        "2. Нажмите кнопку TubeSave на странице ролика — приложение возьмёт cookies сессии.\n"
+        "3. Если кнопки нет: в TubeSave нажмите «Браузер» и установите расширение.\n\n"
+        "Firefox обычно отдаёт cookies надёжнее Chrome. После одного скачивания через "
+        "расширение следующие загрузки из приложения тоже могут использовать эту сессию."
+    )
+
+
+def _reraise_youtube_error(exc: Exception) -> None:
+    message = str(exc)
+    if _is_youtube_bot_check(message):
+        raise _youtube_bot_error() from None
+    raise exc
+
+
 def build_ydl_opts(
     output_dir: Path,
     progress_hook: ProgressCallback | None = None,
@@ -429,6 +759,7 @@ def build_ydl_opts(
     site: str | None = None,
     cancel_event: Event | None = None,
     cleanup: DownloadCleanup | None = None,
+    impersonate: bool = True,
 ) -> dict:
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -469,10 +800,15 @@ def build_ydl_opts(
     else:
         opts["merge_output_format"] = "mp4"
 
+    js_runtimes = _ydl_js_runtimes()
+    if js_runtimes:
+        opts["js_runtimes"] = js_runtimes
+
     # Browser impersonation helps YouTube CDN; also fine for most other sites.
-    impersonate = get_impersonate_target()
-    if impersonate is not None:
-        opts["impersonate"] = impersonate
+    if impersonate:
+        target = get_impersonate_target()
+        if target is not None:
+            opts["impersonate"] = target
 
     progress_hooks: list[ProgressCallback] = []
     if cleanup is not None or cancel_event is not None:
@@ -518,9 +854,14 @@ def build_ydl_opts(
     return opts
 
 
-def fetch_video_info(url: str, cancel_event: Event | None = None) -> dict:
+def fetch_video_info(
+    url: str,
+    cancel_event: Event | None = None,
+    cookies: str = "",
+) -> dict:
     url = url.strip()
-    if detect_site(url) is None:
+    site = detect_site(url)
+    if site is None:
         raise ValueError(
             "Неподдерживаемая ссылка. Доступны:\n" + SUPPORTED_SITES_HINT
         )
@@ -532,13 +873,23 @@ def fetch_video_info(url: str, cancel_event: Event | None = None) -> dict:
         "noplaylist": True,
         "socket_timeout": 30,
     }
+    js_runtimes = _ydl_js_runtimes()
+    if js_runtimes:
+        opts["js_runtimes"] = js_runtimes
     impersonate = get_impersonate_target()
     if impersonate is not None:
         opts["impersonate"] = impersonate
+    if site == "youtube":
+        _apply_youtube_cookies(opts, _ensure_youtube_cookiefile(cookies))
     if cancel_event is not None:
         opts["progress_hooks"] = [lambda data: _abort_if_cancelled(data, cancel_event)]
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(url, download=False)
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+    except Exception as exc:
+        if site == "youtube":
+            _reraise_youtube_error(exc)
+        raise
     _check_cancel(cancel_event)
     if info is None:
         raise RuntimeError("Не удалось получить информацию о видео.")
@@ -844,28 +1195,35 @@ def download_yandex_music(
         raise
 
 
+def _is_youtube_bot_check(message: str) -> bool:
+    lower = (message or "").lower().replace("’", "'")
+    return "sign in to confirm" in lower or "not a bot" in lower
+
+
 def _youtube_needs_client_fallback(message: str) -> bool:
     lower = (message or "").lower()
-    return any(
+    return _is_youtube_bot_check(lower) or any(
         needle in lower
         for needle in (
             "403",
             "forbidden",
             "not available",
             "requested format is not available",
-            "sign in to confirm",
-            "confirm you're not a bot",
             "private video",
             "login required",
         )
     )
 
 
-def _with_youtube_android_clients(opts: dict) -> dict:
+def _with_youtube_fallback_clients(opts: dict, *, authed: bool) -> dict:
     fallback = dict(opts)
+    fallback.pop("impersonate", None)
     extractor_args = dict(fallback.get("extractor_args") or {})
     youtube_args = dict(extractor_args.get("youtube") or {})
-    youtube_args["player_client"] = ["android", "android_sdkless", "ios", "mweb"]
+    if authed:
+        youtube_args["player_client"] = ["tv", "tv_downgraded", "web_embedded", "web_safari"]
+    else:
+        youtube_args["player_client"] = ["android_vr", "web_embedded", "tv"]
     extractor_args["youtube"] = youtube_args
     fallback["extractor_args"] = extractor_args
     return fallback
@@ -918,6 +1276,10 @@ def download_video(
             cancel_event=cancel_event,
             cleanup=cleanup,
         )
+        youtube_cookie_file = None
+        if site == "youtube":
+            youtube_cookie_file = _ensure_youtube_cookiefile(cookies, report)
+            _apply_youtube_cookies(opts, youtube_cookie_file)
 
         last_error: Exception | None = None
         filepath: Path | None = None
@@ -940,28 +1302,53 @@ def download_video(
                 # Retry only for transient CDN / player-client blocks.
                 if site == "youtube":
                     if not _youtube_needs_client_fallback(message):
-                        raise
-                    # Player-client blocks won't fix themselves — fall through to android.
+                        _reraise_youtube_error(exc)
+                    if _is_youtube_bot_check(message) and not _looks_like_youtube_cookies(cookies):
+                        refreshed = _ensure_youtube_cookiefile(
+                            cookies, report, refresh_from_browser=True
+                        )
+                        if refreshed is not None:
+                            youtube_cookie_file = refreshed
+                            _apply_youtube_cookies(opts, youtube_cookie_file)
+                            try:
+                                filepath = _try_download(
+                                    url,
+                                    opts,
+                                    report,
+                                    audio_only=audio_only,
+                                    cancel_event=cancel_event,
+                                )
+                                break
+                            except DownloadCancelled:
+                                raise
+                            except yt_dlp.utils.DownloadError as retry_exc:
+                                last_error = retry_exc
+                    # Player-client blocks need a different client, not more retries.
                     break
                 if "403" not in message and "Forbidden" not in message:
                     raise
-                # Keep retrying 403 a few times before the android fallback.
+                # Keep retrying 403 a few times before the client fallback.
 
         if filepath is None:
             report("Обход блокировки…")
             fallback = dict(opts)
             fallback["format"] = fallback_format_selector(audio_only=audio_only, quality=quality)
             if site == "youtube":
-                fallback = _with_youtube_android_clients(fallback)
+                authed = youtube_cookie_file is not None and _cookie_file_has_youtube_auth(
+                    youtube_cookie_file
+                )
+                fallback = _with_youtube_fallback_clients(fallback, authed=authed)
             try:
                 filepath = _try_download(
                     url, fallback, report, audio_only=audio_only, cancel_event=cancel_event
                 )
             except DownloadCancelled:
                 raise
-            except Exception:
+            except Exception as exc:
                 if _is_cancelled(cancel_event):
                     raise DownloadCancelled("Загрузка отменена") from None
+                if site == "youtube":
+                    _reraise_youtube_error(last_error or exc)
                 assert last_error is not None
                 raise last_error from None
 

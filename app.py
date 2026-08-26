@@ -974,6 +974,57 @@ class YouTubeDownloaderApp(tk.Tk):
             state="disabled",
         )
         self.log_text.pack(fill="both", expand=True, pady=(6, 0))
+        self._bind_log_clipboard(self.log_text)
+
+    def _bind_log_clipboard(self, widget: tk.Text) -> None:
+        def copy_selection(_event: tk.Event | None = None) -> str:
+            try:
+                text = widget.get("sel.first", "sel.last")
+            except tk.TclError:
+                return "break"
+            if text:
+                self.clipboard_clear()
+                self.clipboard_append(text)
+            return "break"
+
+        def copy_all(_event: tk.Event | None = None) -> str:
+            was_disabled = str(widget.cget("state")) == "disabled"
+            if was_disabled:
+                widget.configure(state="normal")
+            text = widget.get("1.0", "end-1c")
+            if was_disabled:
+                widget.configure(state="disabled")
+            if text:
+                self.clipboard_clear()
+                self.clipboard_append(text)
+            return "break"
+
+        def select_all(_event: tk.Event | None = None) -> str:
+            was_disabled = str(widget.cget("state")) == "disabled"
+            if was_disabled:
+                widget.configure(state="normal")
+            widget.tag_remove("sel", "1.0", "end")
+            widget.tag_add("sel", "1.0", "end-1c")
+            widget.mark_set("insert", "1.0")
+            widget.see("insert")
+            if was_disabled:
+                widget.configure(state="disabled")
+            return "break"
+
+        widget.bind("<Control-c>", copy_selection)
+        widget.bind("<Control-C>", copy_selection)
+        widget.bind("<Control-a>", select_all)
+        widget.bind("<Control-A>", select_all)
+        widget.bind("<Control-Shift-C>", copy_all)
+        widget.bind("<Control-Shift-c>", copy_all)
+
+        menu = tk.Menu(widget, tearoff=0, bg=COLORS["surface"], fg=COLORS["text"])
+        menu.add_command(label="Копировать", command=lambda: copy_selection())
+        menu.add_command(label="Копировать всё", command=lambda: copy_all())
+        menu.add_separator()
+        menu.add_command(label="Выделить всё", command=lambda: select_all())
+        self._context_menus.append(menu)
+        widget.bind("<Button-3>", lambda event: menu.tk_popup(event.x_root, event.y_root))
 
     def _apply_theme(self) -> None:
         palette = DARK if self._theme == "dark" else LIGHT
@@ -1523,7 +1574,10 @@ class YouTubeDownloaderApp(tk.Tk):
             "Chrome Web Store или Яндекс.Браузер Beta для разработки.\n\n"
             f"Приложение можно не держать открытым: по кнопке «Скачать»\n"
             "браузер сам запустит TubeSave (если спросит разрешение — «Открыть»).\n"
-            "Протокол tubesave:// регистрируется при каждом запуске.",
+            "Протокол tubesave:// регистрируется при каждом запуске.\n\n"
+            "YouTube иногда просит «подтвердить, что вы не бот». Тогда откройте\n"
+            "ролик в браузере (лучше войти в Google) и скачайте кнопкой TubeSave\n"
+            "на странице — так подхватятся cookies сессии.",
         )
 
     def _set_busy(self, busy: bool) -> None:
@@ -1696,7 +1750,11 @@ class YouTubeDownloaderApp(tk.Tk):
             try:
                 label = site_label(url)
                 self._events.put(("stage", f"Запрос к {label}"))
-                info = fetch_video_info(url, cancel_event=self._cancel_event)
+                info = fetch_video_info(
+                    url,
+                    cancel_event=self._cancel_event,
+                    cookies=getattr(self, "_pending_cookies", "") or "",
+                )
                 title = info.get("title", "Без названия")
                 duration = info.get("duration")
                 uploader = (

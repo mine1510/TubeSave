@@ -19,6 +19,7 @@ browser-extension/extension.pem
 tubesave-native-host.bat
 com.tubesave.host.json
 native-extension-ids.json
+youtube-cookies.txt
 .DS_Store
 Thumbs.db
 desktop.ini
