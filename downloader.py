@@ -989,6 +989,7 @@ def fetch_video_info(
         opts["impersonate"] = impersonate
     if site == "youtube":
         _apply_youtube_cookies(opts, _ensure_youtube_cookiefile(cookies))
+        opts = _with_youtube_preferred_clients(opts)
     if cancel_event is not None:
         opts["progress_hooks"] = [lambda data: _abort_if_cancelled(data, cancel_event)]
     _apply_direct_network(opts)
@@ -996,7 +997,16 @@ def fetch_video_info(
         with _youtube_dl(opts) as ydl:
             info = ydl.extract_info(url, download=False)
     except Exception as exc:
-        if _is_proxy_error(str(exc)):
+        if site == "youtube" and _youtube_needs_client_fallback(str(exc)):
+            retry_opts = _with_youtube_fallback_clients(dict(opts), authed=False)
+            try:
+                with _youtube_dl(retry_opts) as ydl:
+                    info = ydl.extract_info(url, download=False)
+            except Exception as retry_exc:
+                if _is_proxy_error(str(retry_exc)):
+                    raise _proxy_error() from None
+                _reraise_youtube_error(retry_exc)
+        elif _is_proxy_error(str(exc)):
             # Retry without browser impersonation (urllib path respects proxy="").
             retry_opts = dict(opts)
             retry_opts.pop("impersonate", None)
@@ -1345,7 +1355,7 @@ def _is_youtube_bot_check(message: str) -> bool:
 
 
 def _youtube_needs_client_fallback(message: str) -> bool:
-    lower = (message or "").lower()
+    lower = (message or "").lower().replace("’", "'")
     return _is_youtube_bot_check(lower) or any(
         needle in lower
         for needle in (
@@ -1353,24 +1363,38 @@ def _youtube_needs_client_fallback(message: str) -> bool:
             "forbidden",
             "not available",
             "requested format is not available",
+            "page needs to be reloaded",
             "private video",
             "login required",
+            "please sign in",
         )
     )
+
+
+def _apply_youtube_player_clients(opts: dict, clients: list[str]) -> dict:
+    result = dict(opts)
+    extractor_args = dict(result.get("extractor_args") or {})
+    youtube_args = dict(extractor_args.get("youtube") or {})
+    youtube_args["player_client"] = list(clients)
+    extractor_args["youtube"] = youtube_args
+    result["extractor_args"] = extractor_args
+    return result
+
+
+def _with_youtube_preferred_clients(opts: dict) -> dict:
+    # android_vr is currently the most reliable for Shorts/public videos.
+    # tv / tv_downgraded often fail with "The page needs to be reloaded".
+    return _apply_youtube_player_clients(opts, ["android_vr", "web_embedded", "mweb"])
 
 
 def _with_youtube_fallback_clients(opts: dict, *, authed: bool) -> dict:
     fallback = dict(opts)
     fallback.pop("impersonate", None)
-    extractor_args = dict(fallback.get("extractor_args") or {})
-    youtube_args = dict(extractor_args.get("youtube") or {})
     if authed:
-        youtube_args["player_client"] = ["tv", "tv_downgraded", "web_embedded", "web_safari"]
+        clients = ["android_vr", "mweb", "web_embedded", "web_safari", "tv"]
     else:
-        youtube_args["player_client"] = ["android_vr", "web_embedded", "tv"]
-    extractor_args["youtube"] = youtube_args
-    fallback["extractor_args"] = extractor_args
-    return fallback
+        clients = ["android_vr", "web_embedded", "mweb", "tv"]
+    return _apply_youtube_player_clients(fallback, clients)
 
 
 def download_video(
@@ -1424,6 +1448,7 @@ def download_video(
         if site == "youtube":
             youtube_cookie_file = _ensure_youtube_cookiefile(cookies, report)
             _apply_youtube_cookies(opts, youtube_cookie_file)
+            opts = _with_youtube_preferred_clients(opts)
 
         last_error: Exception | None = None
         filepath: Path | None = None
