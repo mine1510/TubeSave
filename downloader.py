@@ -988,7 +988,10 @@ def fetch_video_info(
     if impersonate is not None:
         opts["impersonate"] = impersonate
     if site == "youtube":
-        _apply_youtube_cookies(opts, _ensure_youtube_cookiefile(cookies))
+        # Save extension cookies for later, but don't attach them on the first try.
+        # Stale/account cookies make yt-dlp skip android_vr and then fail with
+        # "Requested format is not available" on many public videos.
+        _ensure_youtube_cookiefile(cookies)
         opts = _with_youtube_preferred_clients(opts)
     if cancel_event is not None:
         opts["progress_hooks"] = [lambda data: _abort_if_cancelled(data, cancel_event)]
@@ -997,16 +1000,30 @@ def fetch_video_info(
         with _youtube_dl(opts) as ydl:
             info = ydl.extract_info(url, download=False)
     except Exception as exc:
-        if site == "youtube" and _youtube_needs_client_fallback(str(exc)):
-            retry_opts = _with_youtube_fallback_clients(dict(opts), authed=False)
+        message = str(exc)
+        if site == "youtube" and _youtube_needs_client_fallback(message):
+            cookie_file = _ensure_youtube_cookiefile(cookies)
+            retry_opts = dict(opts)
+            if _youtube_needs_cookies(message) and cookie_file is not None:
+                _apply_youtube_cookies(retry_opts, cookie_file)
+                retry_opts = _with_youtube_authed_clients(retry_opts)
+            else:
+                retry_opts = _strip_youtube_cookies(retry_opts)
+                retry_opts = _with_youtube_preferred_clients(retry_opts)
             try:
                 with _youtube_dl(retry_opts) as ydl:
                     info = ydl.extract_info(url, download=False)
             except Exception as retry_exc:
-                if _is_proxy_error(str(retry_exc)):
-                    raise _proxy_error() from None
-                _reraise_youtube_error(retry_exc)
-        elif _is_proxy_error(str(exc)):
+                # Last resort: cookieless android_vr for public videos.
+                last_opts = _with_youtube_preferred_clients(_strip_youtube_cookies(dict(opts)))
+                try:
+                    with _youtube_dl(last_opts) as ydl:
+                        info = ydl.extract_info(url, download=False)
+                except Exception as last_exc:
+                    if _is_proxy_error(str(last_exc)):
+                        raise _proxy_error() from None
+                    _reraise_youtube_error(retry_exc if _youtube_needs_cookies(message) else last_exc)
+        elif _is_proxy_error(message):
             # Retry without browser impersonation (urllib path respects proxy="").
             retry_opts = dict(opts)
             retry_opts.pop("impersonate", None)
@@ -1381,20 +1398,48 @@ def _apply_youtube_player_clients(opts: dict, clients: list[str]) -> dict:
     return result
 
 
+def _strip_youtube_cookies(opts: dict) -> dict:
+    result = dict(opts)
+    result.pop("cookiefile", None)
+    return result
+
+
 def _with_youtube_preferred_clients(opts: dict) -> dict:
     # android_vr is currently the most reliable for Shorts/public videos.
-    # tv / tv_downgraded often fail with "The page needs to be reloaded".
-    return _apply_youtube_player_clients(opts, ["android_vr", "web_embedded", "mweb"])
+    # Do not mix in web/mweb here: with account cookies yt-dlp skips android_vr
+    # (no cookie support) and the remaining clients often return no formats.
+    return _apply_youtube_player_clients(opts, ["android_vr"])
+
+
+def _with_youtube_authed_clients(opts: dict) -> dict:
+    """Clients that accept cookies (members-only / bot-check retries)."""
+    return _apply_youtube_player_clients(
+        opts, ["mweb", "web_safari", "web_embedded", "tv", "web"]
+    )
 
 
 def _with_youtube_fallback_clients(opts: dict, *, authed: bool) -> dict:
     fallback = dict(opts)
     fallback.pop("impersonate", None)
     if authed:
-        clients = ["android_vr", "mweb", "web_embedded", "web_safari", "tv"]
-    else:
-        clients = ["android_vr", "web_embedded", "mweb", "tv"]
-    return _apply_youtube_player_clients(fallback, clients)
+        return _with_youtube_authed_clients(fallback)
+    return _with_youtube_preferred_clients(fallback)
+
+
+def _youtube_needs_cookies(message: str) -> bool:
+    lower = (message or "").lower().replace("’", "'")
+    return _is_youtube_bot_check(lower) or any(
+        needle in lower
+        for needle in (
+            "please sign in",
+            "login required",
+            "private video",
+            "members only",
+            "join this channel",
+            "confirm your age",
+            "age-restricted",
+        )
+    )
 
 
 def download_video(
@@ -1445,9 +1490,10 @@ def download_video(
             cleanup=cleanup,
         )
         youtube_cookie_file = None
+        youtube_used_cookies = False
         if site == "youtube":
+            # Persist cookies from the extension, but start cookieless so android_vr works.
             youtube_cookie_file = _ensure_youtube_cookiefile(cookies, report)
-            _apply_youtube_cookies(opts, youtube_cookie_file)
             opts = _with_youtube_preferred_clients(opts)
 
         last_error: Exception | None = None
@@ -1472,26 +1518,34 @@ def download_video(
                 if site == "youtube":
                     if not _youtube_needs_client_fallback(message):
                         _reraise_youtube_error(exc)
-                    if _is_youtube_bot_check(message) and not _looks_like_youtube_cookies(cookies):
+                    if (
+                        _youtube_needs_cookies(message)
+                        and youtube_cookie_file is not None
+                        and not youtube_used_cookies
+                    ):
+                        report("Нужна сессия YouTube…")
                         refreshed = _ensure_youtube_cookiefile(
                             cookies, report, refresh_from_browser=True
                         )
                         if refreshed is not None:
                             youtube_cookie_file = refreshed
-                            _apply_youtube_cookies(opts, youtube_cookie_file)
-                            try:
-                                filepath = _try_download(
-                                    url,
-                                    opts,
-                                    report,
-                                    audio_only=audio_only,
-                                    cancel_event=cancel_event,
-                                )
-                                break
-                            except DownloadCancelled:
-                                raise
-                            except yt_dlp.utils.DownloadError as retry_exc:
-                                last_error = retry_exc
+                        _apply_youtube_cookies(opts, youtube_cookie_file)
+                        opts = _with_youtube_authed_clients(opts)
+                        youtube_used_cookies = True
+                        try:
+                            filepath = _try_download(
+                                url,
+                                opts,
+                                report,
+                                audio_only=audio_only,
+                                cancel_event=cancel_event,
+                            )
+                            break
+                        except DownloadCancelled:
+                            raise
+                        except yt_dlp.utils.DownloadError as retry_exc:
+                            last_error = retry_exc
+                            message = str(retry_exc)
                     # Player-client blocks need a different client, not more retries.
                     break
                 if "403" not in message and "Forbidden" not in message:
@@ -1500,13 +1554,17 @@ def download_video(
 
         if filepath is None:
             report("Обход блокировки…")
-            fallback = dict(opts)
+            # Public videos: cookieless android_vr + loose format. Cookies often break formats.
+            fallback = _with_youtube_preferred_clients(_strip_youtube_cookies(dict(opts)))
+            fallback.pop("impersonate", None)
             fallback["format"] = fallback_format_selector(audio_only=audio_only, quality=quality)
-            if site == "youtube":
-                authed = youtube_cookie_file is not None and _cookie_file_has_youtube_auth(
-                    youtube_cookie_file
-                )
-                fallback = _with_youtube_fallback_clients(fallback, authed=authed)
+            if site == "youtube" and youtube_used_cookies:
+                # Already tried with cookies; stay cookieless.
+                pass
+            elif site == "youtube" and last_error is not None and _youtube_needs_cookies(str(last_error)):
+                if youtube_cookie_file is not None:
+                    _apply_youtube_cookies(fallback, youtube_cookie_file)
+                    fallback = _with_youtube_authed_clients(fallback)
             try:
                 filepath = _try_download(
                     url, fallback, report, audio_only=audio_only, cancel_event=cancel_event
@@ -1516,10 +1574,33 @@ def download_video(
             except Exception as exc:
                 if _is_cancelled(cancel_event):
                     raise DownloadCancelled("Загрузка отменена") from None
-                if site == "youtube":
+                if site == "youtube" and fallback.get("cookiefile"):
+                    # One more try without cookies for public clips.
+                    report("Повтор без cookies…")
+                    bare = _with_youtube_preferred_clients(_strip_youtube_cookies(dict(fallback)))
+                    bare["format"] = fallback_format_selector(
+                        audio_only=audio_only, quality=quality
+                    )
+                    try:
+                        filepath = _try_download(
+                            url,
+                            bare,
+                            report,
+                            audio_only=audio_only,
+                            cancel_event=cancel_event,
+                        )
+                    except DownloadCancelled:
+                        raise
+                    except Exception:
+                        _reraise_youtube_error(last_error or exc)
+                elif site == "youtube":
                     _reraise_youtube_error(last_error or exc)
-                assert last_error is not None
-                raise last_error from None
+                else:
+                    assert last_error is not None
+                    raise last_error from None
+                if filepath is None:
+                    assert last_error is not None
+                    raise last_error from None
 
         report("Проверка результата…")
         if audio_only:
