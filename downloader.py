@@ -196,6 +196,41 @@ YANDEX_TRACK_RE = re.compile(
 YANDEX_API = "https://api.music.yandex.net"
 YANDEX_SIGN_KEY = "p93jhgh689SBReK6ghtw62"
 YANDEX_MD5_SALT = "XGRlBW9FXlekgbPrRHuSiA"
+YANDEX_TOKEN_BY_SESSION_CLIENT_ID = "c0ebe342af7d48fbbbfcf2d2eedb8f9e"
+YANDEX_TOKEN_BY_SESSION_CLIENT_SECRET = "ad0a908f0aa341a182a37ecd75bc319e"
+YANDEX_MUSIC_CLIENT_ID = "23cabbbdc6cd418abb4b39c32c41195d"
+YANDEX_MUSIC_CLIENT_SECRET = "53bc75238f0c4d08a118e51fe9203300"
+_YANDEX_SESSION_NAMES = {"Session_id", "sessionid2"}
+_YANDEX_OAUTH_COOKIE_NAMES = _YANDEX_SESSION_NAMES | {
+    "sessar",
+    "yandexuid",
+    "yandex_login",
+    "i",
+    "yp",
+    "ys",
+    "L",
+    "yashr",
+    "lah",
+    "mda",
+    "my",
+}
+_YANDEX_OAUTH_COOKIE_ORDER = (
+    "Session_id",
+    "sessionid2",
+    "sessar",
+    "yandexuid",
+    "yandex_login",
+    "i",
+    "yp",
+    "ys",
+    "L",
+    "yashr",
+    "lah",
+    "mda",
+    "my",
+)
+_YANDEX_MAX_COOKIE_HEADER = 4096
+_YANDEX_BROWSER_COOKIES_TRIED = False
 
 _IMPERSONATE_TARGET = None
 
@@ -1122,7 +1157,322 @@ def _safe_filename(text: str) -> str:
     return (cleaned[:180] or "track")
 
 
-def _yandex_headers(page_url: str, cookies: str = "") -> dict[str, str]:
+def _yandex_cookie_file() -> Path:
+    from bridge import user_data_dir
+
+    folder = user_data_dir()
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder / "yandex-cookies.txt"
+
+
+def _yandex_token_cache_file() -> Path:
+    from bridge import user_data_dir
+
+    folder = user_data_dir()
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder / "yandex-music-token.json"
+
+
+def _looks_like_yandex_cookies(raw: str) -> bool:
+    text = (raw or "").strip()
+    if not text:
+        return False
+    if text.startswith("["):
+        lower = text.lower()
+        return "session_id" in lower or "yandex" in lower
+    return any(name in text for name in _YANDEX_SESSION_NAMES)
+
+
+def _yandex_domain_ok(domain: str) -> bool:
+    host = (domain or "").lstrip(".").lower()
+    return host.endswith("yandex.ru") or host.endswith("yandex.net")
+
+
+def _yandex_parse_cookie_header(header: str) -> dict[str, str]:
+    parsed: dict[str, str] = {}
+    for piece in (header or "").split(";"):
+        chunk = piece.strip()
+        if "=" not in chunk:
+            continue
+        name, value = chunk.split("=", 1)
+        name = name.strip()
+        if name:
+            parsed[name] = value.strip()
+    return parsed
+
+
+def _yandex_trim_cookie_header(header: str) -> str:
+    parsed = _yandex_parse_cookie_header(header)
+    if not (parsed.keys() & _YANDEX_SESSION_NAMES):
+        return ""
+    parts: list[str] = []
+    seen: set[str] = set()
+    for name in _YANDEX_OAUTH_COOKIE_ORDER:
+        value = parsed.get(name)
+        if not value or name in seen:
+            continue
+        seen.add(name)
+        parts.append(f"{name}={value}")
+    for name, value in parsed.items():
+        if name in seen or name not in _YANDEX_OAUTH_COOKIE_NAMES or not value:
+            continue
+        seen.add(name)
+        parts.append(f"{name}={value}")
+    trimmed = "; ".join(parts)
+    if len(trimmed.encode("utf-8")) > _YANDEX_MAX_COOKIE_HEADER:
+        return ""
+    return trimmed
+
+
+def _yandex_cookie_header_from_jar(jar) -> str:
+    parsed: dict[str, str] = {}
+    for cookie in jar:
+        if not cookie.value:
+            continue
+        if not _yandex_domain_ok(cookie.domain or ""):
+            continue
+        name = str(cookie.name or "")
+        if not name or name not in _YANDEX_OAUTH_COOKIE_NAMES:
+            continue
+        parsed.setdefault(name, str(cookie.value))
+    return _yandex_trim_cookie_header("; ".join(f"{name}={value}" for name, value in parsed.items()))
+
+
+def _yandex_cookies_payload_to_header(raw: str) -> str:
+    text = (raw or "").strip()
+    if not text:
+        return ""
+    if text.startswith("["):
+        try:
+            items = json.loads(text)
+        except json.JSONDecodeError:
+            return ""
+        if not isinstance(items, list):
+            return ""
+        parsed: dict[str, str] = {}
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "").strip()
+            value = str(item.get("value") or "")
+            domain = str(item.get("domain") or "")
+            if not name or not value or not _yandex_domain_ok(domain):
+                continue
+            if name not in _YANDEX_OAUTH_COOKIE_NAMES:
+                continue
+            parsed.setdefault(name, value)
+        return _yandex_trim_cookie_header("; ".join(f"{name}={value}" for name, value in parsed.items()))
+    return _yandex_trim_cookie_header(text)
+
+
+def _save_yandex_cookie_header(header: str) -> bool:
+    text = _yandex_trim_cookie_header((header or "").strip())
+    if not text:
+        return False
+    try:
+        dest = _yandex_cookie_file()
+        dest.write_text(text, encoding="utf-8")
+        return dest.is_file() and dest.stat().st_size > 0
+    except OSError:
+        return False
+
+
+def _load_yandex_cookie_header() -> str:
+    path = _yandex_cookie_file()
+    if not path.is_file():
+        return ""
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return ""
+    return _yandex_trim_cookie_header(text)
+
+
+def _extract_yandex_cookies_from_browsers(
+    report: Callable[[str], None] | None = None,
+    *,
+    force: bool = False,
+) -> bool:
+    global _YANDEX_BROWSER_COOKIES_TRIED
+    if _YANDEX_BROWSER_COOKIES_TRIED and not force:
+        return bool(_load_yandex_cookie_header())
+    _YANDEX_BROWSER_COOKIES_TRIED = True
+    try:
+        from yt_dlp.cookies import extract_cookies_from_browser
+    except Exception:
+        return False
+    logger = _QuietCookieLogger()
+    if report is not None:
+        report("Чтение cookies Яндекса из браузера…")
+    for browser, profile, _label in _browser_cookie_specs():
+        if not _browser_profile_exists(browser, profile):
+            continue
+        try:
+            jar = extract_cookies_from_browser(browser, profile, logger)
+        except Exception:
+            continue
+        header = _yandex_cookie_header_from_jar(jar)
+        if header and _save_yandex_cookie_header(header):
+            return True
+    return bool(_load_yandex_cookie_header())
+
+
+def _ensure_yandex_cookie_header(
+    cookies: str = "",
+    report: Callable[[str], None] | None = None,
+    *,
+    refresh_from_browser: bool = False,
+) -> str:
+    imported = _yandex_cookies_payload_to_header(cookies)
+    if imported:
+        _save_yandex_cookie_header(imported)
+        if report is not None:
+            report("Сессия Яндекс.Музыки из браузера…")
+        return imported
+    if not refresh_from_browser:
+        cached = _load_yandex_cookie_header()
+        if cached:
+            return cached
+    if _extract_yandex_cookies_from_browsers(report, force=refresh_from_browser):
+        return _load_yandex_cookie_header()
+    return ""
+
+
+def _load_yandex_music_token_cache() -> str:
+    path = _yandex_token_cache_file()
+    if not path.is_file():
+        return ""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    token = str(data.get("access_token") or "")
+    expires_at = float(data.get("expires_at") or 0)
+    if token and expires_at > time.time() + 60:
+        return token
+    return ""
+
+
+def _save_yandex_music_token_cache(token: str, expires_in: int) -> None:
+    if not token:
+        return
+    payload = {
+        "access_token": token,
+        "expires_at": time.time() + max(int(expires_in or 0), 300),
+    }
+    try:
+        _yandex_token_cache_file().write_text(json.dumps(payload), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _http_form_post(url: str, data: dict[str, str], headers: dict[str, str]) -> dict:
+    body = urlencode(data).encode("utf-8")
+    req_headers = {
+        **headers,
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Accept": "application/json",
+    }
+    req = Request(url, data=body, headers=req_headers, method="POST")
+    try:
+        with urlopen(req, timeout=25) as resp:
+            raw = resp.read()
+    except HTTPError as exc:
+        detail = ""
+        with contextlib.suppress(Exception):
+            detail = exc.read().decode("utf-8", errors="replace")
+        if exc.code == 413:
+            raise RuntimeError(
+                "Яндекс.Музыка: слишком много cookies сессии.\n"
+                "Обновите TubeSave до последней версии и перезагрузите расширение."
+            ) from exc
+        raise RuntimeError(detail or str(exc)) from exc
+    payload = json.loads(raw.decode("utf-8", errors="replace"))
+    return payload if isinstance(payload, dict) else {}
+
+
+def _yandex_x_token_from_cookies(cookie_header: str) -> str:
+    cookie_header = _yandex_trim_cookie_header(cookie_header)
+    if not cookie_header:
+        raise RuntimeError("sessionid.invalid")
+    payload = _http_form_post(
+        "https://mobileproxy.passport.yandex.net/1/bundle/oauth/token_by_sessionid",
+        {
+            "client_id": YANDEX_TOKEN_BY_SESSION_CLIENT_ID,
+            "client_secret": YANDEX_TOKEN_BY_SESSION_CLIENT_SECRET,
+        },
+        {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
+            ),
+            "Ya-Client-Host": "passport.yandex.ru",
+            "Ya-Client-Cookie": cookie_header,
+        },
+    )
+    token = str(payload.get("access_token") or "")
+    if token:
+        return token
+    errors = payload.get("errors")
+    if isinstance(errors, list) and errors:
+        raise RuntimeError(", ".join(str(item) for item in errors))
+    raise RuntimeError(str(payload.get("error") or "sessionid.invalid"))
+
+
+def _yandex_music_token_from_x_token(x_token: str) -> tuple[str, int]:
+    payload = _http_form_post(
+        "https://oauth.mobile.yandex.net/1/token",
+        {
+            "client_id": YANDEX_MUSIC_CLIENT_ID,
+            "client_secret": YANDEX_MUSIC_CLIENT_SECRET,
+            "grant_type": "x-token",
+            "access_token": x_token,
+        },
+        {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
+            ),
+        },
+    )
+    token = str(payload.get("access_token") or "")
+    if not token:
+        raise RuntimeError(str(payload.get("error") or "music-token-failed"))
+    expires_in = int(payload.get("expires_in") or 3600)
+    return token, expires_in
+
+
+def _ensure_yandex_music_oauth(
+    cookies: str = "",
+    report: Callable[[str], None] | None = None,
+) -> str:
+    cached = _load_yandex_music_token_cache()
+    if cached:
+        return cached
+
+    cookie_header = _ensure_yandex_cookie_header(cookies, report)
+    if not cookie_header:
+        return ""
+
+    if report is not None:
+        report("Авторизация Яндекс.Музыки…")
+    try:
+        x_token = _yandex_x_token_from_cookies(cookie_header)
+        music_token, expires_in = _yandex_music_token_from_x_token(x_token)
+    except Exception:
+        return ""
+    _save_yandex_music_token_cache(music_token, expires_in)
+    return music_token
+
+
+def prepare_yandex_cookies(raw: str) -> str:
+    """Compact Yandex session cookies only — never pass a huge browser payload through."""
+    return _yandex_cookies_payload_to_header(raw or "")
+
+
+def _yandex_headers(page_url: str, oauth_token: str = "") -> dict[str, str]:
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -1133,15 +1483,28 @@ def _yandex_headers(page_url: str, cookies: str = "") -> dict[str, str]:
         "Referer": page_url or "https://music.yandex.ru/",
         "X-Yandex-Music-Client": "YandexMusicAndroid/24023231",
     }
-    if cookies:
-        headers["Cookie"] = cookies
+    if oauth_token:
+        headers["Authorization"] = f"OAuth {oauth_token}"
     return headers
 
 
 def _http_read(url: str, headers: dict[str, str], timeout: float = 25.0) -> bytes:
     req = Request(url, headers=headers)
-    with urlopen(req, timeout=timeout) as resp:
-        return resp.read()
+    try:
+        with urlopen(req, timeout=timeout) as resp:
+            return resp.read()
+    except HTTPError as exc:
+        if exc.code == 401:
+            raise RuntimeError(
+                "Яндекс.Музыка: требуется вход в аккаунт.\n"
+                "Откройте music.yandex.ru, войдите в аккаунт и нажмите «Скачать» снова."
+            ) from exc
+        if exc.code == 413:
+            raise RuntimeError(
+                "Яндекс.Музыка: слишком много cookies сессии.\n"
+                "Перезагрузите расширение TubeSave и нажмите «Скачать» снова."
+            ) from exc
+        raise
 
 
 def _http_json(url: str, headers: dict[str, str]) -> dict:
@@ -1305,12 +1668,15 @@ def download_yandex_music(
             "Откройте страницу трека или запустите его в плеере и нажмите «Скачать» снова."
         )
 
+    cookies = prepare_yandex_cookies(cookies)
+
     def report(message: str) -> None:
         _check_cancel(cancel_event)
         if status_callback is not None:
             status_callback(message)
 
-    headers = _yandex_headers(url, cookies)
+    oauth_token = _ensure_yandex_music_oauth(cookies, report)
+    headers = _yandex_headers(url, oauth_token)
     report("Подключение к Яндекс.Музыке…")
     meta = _http_json(f"{YANDEX_API}/tracks/{track_id}", headers)
     tracks = meta.get("result") or []

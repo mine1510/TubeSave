@@ -1011,12 +1011,22 @@ class YouTubeDownloaderApp(tk.Tk):
                 widget.configure(state="disabled")
             return "break"
 
+        def on_control_key(event: tk.Event) -> str | None:
+            keycode = getattr(event, "keycode", None)
+            shift = bool(event.state & 0x1)
+            if keycode == 67:
+                return copy_all(event) if shift else copy_selection(event)
+            if keycode == 65:
+                return select_all(event)
+            return None
+
         widget.bind("<Control-c>", copy_selection)
         widget.bind("<Control-C>", copy_selection)
         widget.bind("<Control-a>", select_all)
         widget.bind("<Control-A>", select_all)
         widget.bind("<Control-Shift-C>", copy_all)
         widget.bind("<Control-Shift-c>", copy_all)
+        widget.bind("<Control-KeyPress>", on_control_key)
 
         menu = tk.Menu(widget, tearoff=0, bg=COLORS["surface"], fg=COLORS["text"])
         menu.add_command(label="Копировать", command=lambda: copy_selection())
@@ -1511,6 +1521,10 @@ class YouTubeDownloaderApp(tk.Tk):
         if last and last[0] == stamp and (now - last[1]) < 6:
             return
         self._last_external = (stamp, now)
+        if "music.yandex." in url.lower() and cookies:
+            from downloader import prepare_yandex_cookies
+
+            cookies = prepare_yandex_cookies(cookies)
         self._pending_cookies = cookies or ""
 
         # Music links always go through audio pipeline.

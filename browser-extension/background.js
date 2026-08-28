@@ -52,36 +52,59 @@ function yandexTrackId(url) {
   return queryMatch ? queryMatch[1] : null;
 }
 
-async function yandexCookieHeader() {
+function yandexDomainOk(domain) {
+  const host = String(domain || "").replace(/^\./, "").toLowerCase();
+  return /yandex\.(ru|net)$/i.test(host);
+}
+
+const YANDEX_COOKIE_NAMES = new Set([
+  "Session_id",
+  "sessionid2",
+  "sessar",
+  "yandexuid",
+  "yandex_login",
+  "i",
+  "yp",
+  "ys",
+  "L",
+  "yashr",
+  "lah",
+  "mda",
+  "my",
+]);
+
+async function yandexCookiePayload() {
   if (!chrome.cookies || !chrome.cookies.getAll) {
     return "";
   }
   try {
-    const groups = await Promise.all([
+    const groups = await Promise.allSettled([
       chrome.cookies.getAll({ domain: "yandex.ru" }),
       chrome.cookies.getAll({ domain: "yandex.net" }),
       chrome.cookies.getAll({ domain: "music.yandex.ru" }),
     ]);
-    const wanted = new Set([
-      "Session_id",
-      "sessionid2",
-      "yandexuid",
-      "i",
-      "yp",
-      "ys",
-      "L",
-      "yashr",
-    ]);
     const seen = new Set();
     const parts = [];
-    for (const cookie of groups.flat()) {
-      if (!cookie || !wanted.has(cookie.name) || seen.has(cookie.name)) {
+    let hasSession = false;
+    for (const result of groups) {
+      if (result.status !== "fulfilled" || !Array.isArray(result.value)) {
         continue;
       }
-      seen.add(cookie.name);
-      parts.push(`${cookie.name}=${cookie.value}`);
+      for (const cookie of result.value) {
+        if (!cookie || !cookie.name || !cookie.value || !yandexDomainOk(cookie.domain)) {
+          continue;
+        }
+        if (!YANDEX_COOKIE_NAMES.has(cookie.name) || seen.has(cookie.name)) {
+          continue;
+        }
+        seen.add(cookie.name);
+        if (cookie.name === "Session_id" || cookie.name === "sessionid2") {
+          hasSession = true;
+        }
+        parts.push(`${cookie.name}=${cookie.value}`);
+      }
     }
-    return parts.join("; ");
+    return hasSession && parts.length ? parts.join("; ") : "";
   } catch {
     return "";
   }
@@ -146,7 +169,7 @@ async function pingBridge() {
 
 async function sendToApp(url, autoStart = true, audioOnly = false, quality = "best") {
   const cookies = isYandexMusic(url)
-    ? await yandexCookieHeader()
+    ? await yandexCookiePayload()
     : isYouTube(url)
       ? await youtubeCookiePayload()
       : "";

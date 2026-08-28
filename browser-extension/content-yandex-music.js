@@ -308,11 +308,37 @@
       return null;
     }
 
-    const download = bar.querySelector(
-      "button[aria-label*='Скачать'], button[aria-label*='Download'], button[aria-label*='download']"
-    );
-    if (download) {
-      const rect = download.getBoundingClientRect();
+    const barRect = bar.getBoundingClientRect();
+    const rightControls = Array.from(
+      bar.querySelectorAll("button[aria-label], [role='button'][aria-label]")
+    )
+      .filter((el) => {
+        const label = (el.getAttribute("aria-label") || "").toLowerCase();
+        if (!label) {
+          return false;
+        }
+        return /текст|lyrics|lyric|слова|очеред|queue|громк|volume|настрой|setting|equaliz|эквал/i.test(
+          label
+        );
+      })
+      .filter((el) => {
+        const rect = el.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0 && rect.left > barRect.left + barRect.width * 0.45;
+      })
+      .sort((a, b) => a.getBoundingClientRect().left - b.getBoundingClientRect().left);
+
+    if (rightControls.length) {
+      const target = rightControls[0];
+      const rect = target.getBoundingClientRect();
+      return {
+        left: rect.left - 42,
+        top: rect.top + (rect.height - 36) / 2,
+      };
+    }
+
+    const host = findPanelActionsHost(bar);
+    if (host) {
+      const rect = host.getBoundingClientRect();
       if (rect.width > 0 && rect.height > 0) {
         return {
           left: rect.left - 42,
@@ -321,21 +347,9 @@
       }
     }
 
-    const host = findPanelActionsHost(bar);
-    if (host) {
-      const rect = host.getBoundingClientRect();
-      if (rect.width > 0 && rect.height > 0) {
-        return {
-          left: rect.left - 6,
-          top: rect.top + (rect.height - 36) / 2,
-        };
-      }
-    }
-
-    const barRect = bar.getBoundingClientRect();
     if (barRect.width > 0 && barRect.height > 0) {
       return {
-        left: barRect.right - 210,
+        left: barRect.right - 196,
         top: barRect.top + (barRect.height - 36) / 2,
       };
     }
