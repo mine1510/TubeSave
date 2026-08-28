@@ -989,7 +989,7 @@ def fetch_video_info(
         opts["impersonate"] = impersonate
     if site == "youtube":
         # Save extension cookies for later, but don't attach them on the first try.
-        # Stale/account cookies make yt-dlp skip android_vr and then fail with
+        # Stale/account cookies make yt-dlp skip android and then fail with
         # "Requested format is not available" on many public videos.
         _ensure_youtube_cookiefile(cookies)
         opts = _with_youtube_preferred_clients(opts)
@@ -1014,7 +1014,7 @@ def fetch_video_info(
                 with _youtube_dl(retry_opts) as ydl:
                     info = ydl.extract_info(url, download=False)
             except Exception as retry_exc:
-                # Last resort: cookieless android_vr for public videos.
+                # Last resort: cookieless android for public videos.
                 last_opts = _with_youtube_preferred_clients(_strip_youtube_cookies(dict(opts)))
                 try:
                     with _youtube_dl(last_opts) as ydl:
@@ -1405,10 +1405,9 @@ def _strip_youtube_cookies(opts: dict) -> dict:
 
 
 def _with_youtube_preferred_clients(opts: dict) -> dict:
-    # android_vr is currently the most reliable for Shorts/public videos.
-    # Do not mix in web/mweb here: with account cookies yt-dlp skips android_vr
-    # (no cookie support) and the remaining clients often return no formats.
-    return _apply_youtube_player_clients(opts, ["android_vr"])
+    # android_vr DASH URLs now 403 without a GVS PO token; android still works.
+    # Do not mix in web/mweb here: account cookies skip android and break formats.
+    return _apply_youtube_player_clients(opts, ["android"])
 
 
 def _with_youtube_authed_clients(opts: dict) -> dict:
@@ -1492,7 +1491,7 @@ def download_video(
         youtube_cookie_file = None
         youtube_used_cookies = False
         if site == "youtube":
-            # Persist cookies from the extension, but start cookieless so android_vr works.
+            # Persist cookies from the extension, but start cookieless so android works.
             youtube_cookie_file = _ensure_youtube_cookiefile(cookies, report)
             opts = _with_youtube_preferred_clients(opts)
 
@@ -1554,7 +1553,7 @@ def download_video(
 
         if filepath is None:
             report("Обход блокировки…")
-            # Public videos: cookieless android_vr + loose format. Cookies often break formats.
+            # Public videos: cookieless android + loose format. Cookies often break formats.
             fallback = _with_youtube_preferred_clients(_strip_youtube_cookies(dict(opts)))
             fallback.pop("impersonate", None)
             fallback["format"] = fallback_format_selector(audio_only=audio_only, quality=quality)
