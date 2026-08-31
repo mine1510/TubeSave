@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "TubeSave",
-  "version": "1.3.24",
+  "version": "1.3.25",
   "description": "Скачать видео/Shorts/клипы/музыку в TubeSave — Chrome, Edge, Яндекс.Браузер.",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAvN6IdtXXeYw4vpgvC+nyJ+TXB3Ni5AedtGh0J/5D8cYSJmIP6HhTIMFV1tGf1NtgcGAlR+QjsSeQt1gbNSKBZcdWfSLMR1VaFJa6lIQ0mT0kWueu7QCgo47qXTsZbsyPgZM26mebwx98tiLpWe/tCXJ23QCCwFDvAwerQDFpJ4LEd/O6Z8XptH1tDIT6lvug0K2K3PuV+c1S0iNaYUw+sqECxE0KibALdRsB6BGZPqkc1t3+EIvA+JN4hoFDadewZQxY3+cKC9I7X4y4L78qqM4+jj2kdQKTsUahmm9AMb/OsBHVwa20dFA66S+TPjy1YALLG+De5x2ynbnP1gqvNwIDAQAB",
   "permissions": ["activeTab", "tabs", "scripting", "alarms", "nativeMessaging", "cookies"],

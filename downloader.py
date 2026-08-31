@@ -767,9 +767,10 @@ def format_selector(
         return "ba[ext=m4a]/ba[acodec^=mp4a]/ba/b"
 
     quality = (quality or "best").strip().lower()
-    prefer_avc = site in {None, "youtube"}
 
-    def with_height(height: int) -> str:
+    def with_height(height: int, *, prefer_avc: bool) -> str:
+        # YouTube H.264 (avc1) tops out at 1080p; 1440p/4K are VP9/AV1.
+        # Prefer AVC only when it can actually meet the requested height.
         if prefer_avc:
             return (
                 f"bv*[height<=?{height}][vcodec^=avc1]+ba[ext=m4a]/"
@@ -779,22 +780,23 @@ def format_selector(
                 f"bv*+ba/b"
             )
         return (
+            f"bv*[height<=?{height}]+ba[ext=m4a]/"
             f"bv*[height<=?{height}]+ba/"
-            f"best[height<=?{height}][ext=mp4]/best[height<=?{height}]/"
+            f"best[height<=?{height}]/"
             f"bv*+ba/b"
         )
 
     if quality in {"best", "max", "highest"}:
-        if prefer_avc:
-            return "bv*[vcodec^=avc1]+ba[ext=m4a]/bv*+ba[ext=m4a]/bv*+ba/b"
-        return "bv*+ba/b"
+        # Highest resolution first — do not lock to H.264.
+        return "bv*+ba[ext=m4a]/bv*+ba/b"
 
     try:
         height = int(quality.rstrip("p"))
     except ValueError:
-        return "bv*[vcodec^=avc1]+ba[ext=m4a]/bv*+ba[ext=m4a]/bv*+ba/b" if prefer_avc else "bv*+ba/b"
+        return "bv*+ba[ext=m4a]/bv*+ba/b"
 
-    return with_height(height)
+    prefer_avc = site in {None, "youtube"} and height <= 1080
+    return with_height(height, prefer_avc=prefer_avc)
 
 
 def fallback_format_selector(
@@ -802,16 +804,17 @@ def fallback_format_selector(
     audio_only: bool = False,
     quality: str = "best",
 ) -> str:
+    """Looser selector that still merges best video+audio (not 360p muxed MP4)."""
     if audio_only:
         return "ba/b"
     quality = (quality or "best").strip().lower()
     if quality in {"best", "max", "highest"}:
-        return "best[ext=mp4]/best"
+        return "bv*+ba/b"
     try:
         height = int(quality.rstrip("p"))
     except ValueError:
-        return "best[ext=mp4]/best"
-    return f"best[height<=?{height}][ext=mp4]/best[ext=mp4]/best"
+        return "bv*+ba/b"
+    return f"bv*[height<=?{height}]+ba/bv*+ba/b"
 
 
 def _ydl_storage_opts() -> dict:
@@ -1215,6 +1218,9 @@ def build_ydl_opts(
         )
     else:
         opts["merge_output_format"] = "mp4"
+        # Resolution first. At the same height prefer H.264 so Explorer can show a preview.
+        opts["format_sort"] = ["res", "fps", "hdr:12", "vcodec:h264", "acodec:mp4a", "br"]
+        opts["format_sort_force"] = True
 
     js_runtimes = _ydl_js_runtimes()
     if js_runtimes:
@@ -1299,7 +1305,7 @@ def fetch_video_info(
         opts["impersonate"] = impersonate
     if site == "youtube":
         # Save extension cookies for later, but don't attach them on the first try.
-        # Stale/account cookies make yt-dlp skip android and then fail with
+        # Stale/account cookies make yt-dlp skip tv/android and then fail with
         # "Requested format is not available" on many public videos.
         _ensure_youtube_cookiefile(cookies)
         opts = _with_youtube_preferred_clients(opts)
@@ -2123,9 +2129,10 @@ def _strip_youtube_cookies(opts: dict) -> dict:
 
 
 def _with_youtube_preferred_clients(opts: dict) -> dict:
-    # android_vr DASH URLs now 403 without a GVS PO token; android still works.
-    # Do not mix in web/mweb here: account cookies skip android and break formats.
-    return _apply_youtube_player_clients(opts, ["android"])
+    # tv/ios expose 4K DASH. android still works when those 403, but often
+    # only lists 360–1080p — keep it last so high-res formats win.
+    # Do not mix in web/mweb here: account cookies skip android/tv and drop formats.
+    return _apply_youtube_player_clients(opts, ["tv", "ios", "android"])
 
 
 def _with_youtube_authed_clients(opts: dict) -> dict:

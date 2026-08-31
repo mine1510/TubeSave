@@ -1,7 +1,7 @@
 {
-  "app": "1.3.24",
-  "extension": "1.3.24",
-  "notes": "Аудио: MP3 (перекодировка из AAC) и метаданные — превью, описание, ссылка на автора.",
+  "app": "1.3.25",
+  "extension": "1.3.25",
+  "notes": "Исправлено качество видео: «Лучшее» и 4K больше не режутся до 1080p/360p.",
   "release_page": "https://github.com/mine1510/TubeSave/releases/latest",
   "app_zip": "https://github.com/mine1510/TubeSave/releases/latest/download/TubeSave-Windows.zip",
   "extension_zip": "https://github.com/mine1510/TubeSave/releases/latest/download/TubeSave-Extension.zip"

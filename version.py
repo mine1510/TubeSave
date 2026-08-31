@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-APP_VERSION = "1.3.24"
-EXTENSION_VERSION = "1.3.24"
+APP_VERSION = "1.3.25"
+EXTENSION_VERSION = "1.3.25"
 
 GITHUB_OWNER = "mine1510"
 GITHUB_REPO = "TubeSave"
