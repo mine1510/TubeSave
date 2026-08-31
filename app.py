@@ -26,6 +26,7 @@ from downloader import (
     download_video,
     fetch_video_info,
     is_supported_url,
+    normalize_audio_format,
     site_label,
 )
 from bridge import (
@@ -210,6 +211,12 @@ QUALITY_OPTIONS: list[tuple[str, str]] = [
 ]
 QUALITY_CODES = {code for code, _label in QUALITY_OPTIONS}
 
+AUDIO_FORMAT_OPTIONS: list[tuple[str, str]] = [
+    ("aac", "AAC"),
+    ("mp3", "MP3"),
+]
+AUDIO_FORMAT_CODES = {code for code, _label in AUDIO_FORMAT_OPTIONS}
+
 
 def format_duration(seconds: float | None) -> str:
     if seconds is None or seconds < 0:
@@ -340,6 +347,10 @@ class PillButton(tk.Canvas):
     def set_enabled(self, enabled: bool) -> None:
         self._enabled = enabled
         self.configure(cursor="hand2" if enabled else "arrow")
+        self._draw()
+
+    def set_text(self, text: str) -> None:
+        self._text = text
         self._draw()
 
     def _bg(self) -> str:
@@ -522,6 +533,8 @@ class YouTubeDownloaderApp(tk.Tk):
         self._theme = "dark" if theme == "dark" else "light"
         saved_quality = str(self._settings.get("quality") or "best").strip().lower()
         self._quality = saved_quality if saved_quality in QUALITY_CODES else "best"
+        saved_audio = str(self._settings.get("audio_format") or "aac").strip().lower()
+        self._audio_format = normalize_audio_format(saved_audio)
         COLORS.clear()
         COLORS.update(DARK if self._theme == "dark" else LIGHT)
 
@@ -545,11 +558,13 @@ class YouTubeDownloaderApp(tk.Tk):
         self._entries: list[tk.Entry] = []
         self._pill_buttons: list[tuple[PillButton, str]] = []
         self._quality_chips: list[QualityChip] = []
+        self._audio_format_chips: list[QualityChip] = []
         self._context_menus: list[tk.Menu] = []
         self._bg_image_labels: list[tk.Label] = []
 
         self._set_window_icon()
         self._build_ui()
+        self._sync_audio_button()
         self._apply_theme()
         self._fit_window()
         self.after(80, self._process_events)
@@ -593,6 +608,10 @@ class YouTubeDownloaderApp(tk.Tk):
 
     def _persist_quality(self) -> None:
         self._settings["quality"] = self._quality
+        save_settings(self._settings)
+
+    def _persist_audio_format(self) -> None:
+        self._settings["audio_format"] = self._audio_format
         save_settings(self._settings)
 
     def _set_window_icon(self) -> None:
@@ -647,7 +666,7 @@ class YouTubeDownloaderApp(tk.Tk):
         self.audio_btn = self._register_pill(
             PillButton(
                 actions,
-                "Только аудио",
+                "Аудио AAC",
                 lambda: self._start_download(audio_only=True),
                 width=130,
             )
@@ -859,6 +878,37 @@ class YouTubeDownloaderApp(tk.Tk):
             chip.pack(side="left", padx=(0, 8))
             chip.set_selected(code == self._quality)
             self._quality_chips.append(chip)
+
+        audio_title = tk.Label(
+            quality_inner,
+            text="Формат аудио",
+            font=FONTS["title"],
+            fg=COLORS["text"],
+            bg=COLORS["surface"],
+        )
+        audio_title.pack(anchor="w", pady=(12, 0))
+        self._surface_text_labels.append(audio_title)
+
+        audio_hint = tk.Label(
+            quality_inner,
+            text="AAC копируется как есть. MP3 перекодируется из AAC — YouTube MP3 не отдаёт.",
+            font=FONTS["small"],
+            fg=COLORS["muted"],
+            bg=COLORS["surface"],
+        )
+        audio_hint.pack(anchor="w", pady=(2, 8))
+        self._surface_muted_labels.append(audio_hint)
+
+        audio_row = tk.Frame(quality_inner, bg=COLORS["surface"])
+        audio_row.pack(fill="x")
+        self._surface_frames.append(audio_row)
+
+        self._audio_format_chips = []
+        for code, label in AUDIO_FORMAT_OPTIONS:
+            chip = QualityChip(audio_row, code, label, self._select_audio_format, width=78)
+            chip.pack(side="left", padx=(0, 8))
+            chip.set_selected(code == self._audio_format)
+            self._audio_format_chips.append(chip)
 
         # Info + progress card
         status_card = Card(content)
@@ -1093,6 +1143,9 @@ class YouTubeDownloaderApp(tk.Tk):
         for chip in self._quality_chips:
             chip.configure(bg=COLORS["surface"])
             chip.set_selected(chip.code == self._quality)
+        for chip in self._audio_format_chips:
+            chip.configure(bg=COLORS["surface"])
+            chip.set_selected(chip.code == self._audio_format)
 
     def _select_quality(self, code: str) -> None:
         if code not in QUALITY_CODES:
@@ -1101,6 +1154,22 @@ class YouTubeDownloaderApp(tk.Tk):
         self._persist_quality()
         for chip in self._quality_chips:
             chip.set_selected(chip.code == self._quality)
+
+    def _select_audio_format(self, code: str) -> None:
+        code = normalize_audio_format(code)
+        if code not in AUDIO_FORMAT_CODES:
+            return
+        self._audio_format = code
+        self._persist_audio_format()
+        for chip in self._audio_format_chips:
+            chip.set_selected(chip.code == self._audio_format)
+        self._sync_audio_button()
+
+    def _sync_audio_button(self) -> None:
+        button = getattr(self, "audio_btn", None)
+        if button is None:
+            return
+        button.set_text("Аудио MP3" if self._audio_format == "mp3" else "Аудио AAC")
 
     def _toggle_theme(self) -> None:
         self._theme = "light" if self._theme == "dark" else "dark"
@@ -1472,6 +1541,7 @@ class YouTubeDownloaderApp(tk.Tk):
         audio_only: bool = False,
         quality: str = "best",
         cookies: str = "",
+        audio_format: str = "",
     ) -> None:
         # HTTP thread → UI thread
         self.after(
@@ -1482,6 +1552,7 @@ class YouTubeDownloaderApp(tk.Tk):
                 audio_only=audio_only,
                 quality=quality,
                 cookies=cookies,
+                audio_format=audio_format,
             ),
         )
 
@@ -1505,6 +1576,7 @@ class YouTubeDownloaderApp(tk.Tk):
         audio_only: bool = False,
         quality: str | None = None,
         cookies: str = "",
+        audio_format: str | None = None,
     ) -> None:
         """Fill the URL field from browser extension / protocol / second instance."""
         url = (url or "").strip()
@@ -1515,8 +1587,15 @@ class YouTubeDownloaderApp(tk.Tk):
         if requested_quality not in QUALITY_CODES:
             requested_quality = ""
 
+        requested_format = ""
+        if audio_format not in (None, ""):
+            requested_format = normalize_audio_format(audio_format)
+
         now = time.monotonic()
-        stamp = f"{url}|{int(bool(audio_only))}|{requested_quality or self._quality}"
+        stamp = (
+            f"{url}|{int(bool(audio_only))}|"
+            f"{requested_quality or self._quality}|{requested_format or self._audio_format}"
+        )
         last = self._last_external
         if last and last[0] == stamp and (now - last[1]) < 6:
             return
@@ -1537,8 +1616,18 @@ class YouTubeDownloaderApp(tk.Tk):
             for chip in getattr(self, "_quality_chips", []):
                 chip.set_selected(chip.code == self._quality)
 
+        if audio_only and requested_format in AUDIO_FORMAT_CODES:
+            self._audio_format = requested_format
+            self._persist_audio_format()
+            for chip in getattr(self, "_audio_format_chips", []):
+                chip.set_selected(chip.code == self._audio_format)
+            self._sync_audio_button()
+
         self.url_var.set(url)
-        kind = "AAC" if audio_only else "MP4"
+        if audio_only:
+            kind = "MP3" if self._audio_format == "mp3" else "AAC"
+        else:
+            kind = "MP4"
         quality_label = next(
             (label for code, label in QUALITY_OPTIONS if code == self._quality),
             self._quality,
@@ -1813,8 +1902,9 @@ class YouTubeDownloaderApp(tk.Tk):
         self._events.put(("progress_mode", "indeterminate"))
         self._events.put(("stage", "Подготовка"))
         if audio_only:
-            self._events.put(("status", "Скачивание аудио…"))
-            self._events.put(("log", f"Аудио: {url}"))
+            fmt_label = "MP3" if self._audio_format == "mp3" else "AAC"
+            self._events.put(("status", f"Скачивание аудио ({fmt_label})…"))
+            self._events.put(("log", f"Аудио {fmt_label}: {url}"))
         else:
             quality_label = next(
                 (label for code, label in QUALITY_OPTIONS if code == self._quality),
@@ -1825,6 +1915,7 @@ class YouTubeDownloaderApp(tk.Tk):
             self._events.put(("log", f"Качество: {quality_label}"))
 
         selected_quality = self._quality
+        selected_audio_format = self._audio_format
 
         def status_callback(message: str) -> None:
             stage_map = {
@@ -1835,6 +1926,9 @@ class YouTubeDownloaderApp(tk.Tk):
                 "Проверка результата…": "Проверка",
                 "Объединение завершено": "Слияние",
                 "Встраивание превью…": "Превью",
+                "Превью и метаданные…": "Метаданные",
+                "Перекодирование в MP3…": "MP3",
+                "Перекодирование AAC → MP3…": "MP3",
                 "Обход блокировки…": "Обход",
             }
             stage = stage_map.get(message)
@@ -1889,6 +1983,7 @@ class YouTubeDownloaderApp(tk.Tk):
                         status_callback=status_callback,
                         audio_only=audio_only,
                         quality=selected_quality,
+                        audio_format=selected_audio_format,
                         cookies=getattr(self, "_pending_cookies", "") or "",
                         cancel_event=self._cancel_event,
                     )
@@ -1913,17 +2008,23 @@ class YouTubeDownloaderApp(tk.Tk):
         threading.Thread(target=worker, daemon=True).start()
 
 
-def _handoff_to_running(pending: list[tuple[str, bool, bool, str]], timeout: float = 20.0) -> bool:
+def _handoff_to_running(pending: list[tuple[str, bool, bool, str, str]], timeout: float = 20.0) -> bool:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if pending:
-            if all(try_handoff(url, auto, audio, quality) for url, auto, audio, quality in pending):
+            if all(
+                try_handoff(url, auto, audio, quality, audio_format)
+                for url, auto, audio, quality, audio_format in pending
+            ):
                 return True
         elif is_bridge_alive() and try_focus():
             return True
         time.sleep(0.35)
     if pending:
-        return all(try_handoff(url, auto, audio, quality) for url, auto, audio, quality in pending)
+        return all(
+            try_handoff(url, auto, audio, quality, audio_format)
+            for url, auto, audio, quality, audio_format in pending
+        )
     return is_bridge_alive() and try_focus()
 
 
@@ -1955,11 +2056,11 @@ def main() -> None:
         apply_update_on_start=want_update,
         start_hidden=bool(pending) and not want_update,
     )
-    for url, auto, audio, quality in pending:
+    for url, auto, audio, quality, audio_format in pending:
         app.after(
             400,
-            lambda u=url, a=auto, au=audio, q=quality: app.receive_external_url(
-                u, auto_start=a, audio_only=au, quality=q
+            lambda u=url, a=auto, au=audio, q=quality, f=audio_format: app.receive_external_url(
+                u, auto_start=a, audio_only=au, quality=q, audio_format=f
             ),
         )
     app.mainloop()

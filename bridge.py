@@ -44,6 +44,30 @@ def _normalize_quality(value: object) -> str:
     return "best"
 
 
+def _normalize_audio_format(value: object) -> str:
+    text = str(value or "aac").strip().lower().lstrip(".")
+    if text in {"mp3", "mpeg", "mpga"}:
+        return "mp3"
+    return "aac"
+
+
+def _split_audio(
+    audio_value: object,
+    format_value: object = None,
+    url: str = "",
+) -> tuple[bool, str]:
+    yandex = "music.yandex." in (url or "").lower()
+    fmt = _normalize_audio_format(format_value) if format_value not in (None, "") else ""
+    if audio_value is None:
+        return yandex, fmt
+    text = str(audio_value).strip().lower()
+    if text in {"mp3", "mpeg", "mpga"}:
+        return True, "mp3"
+    if text in {"aac", "m4a"}:
+        return True, fmt or "aac"
+    return _as_bool(audio_value, yandex), fmt
+
+
 def _as_bool(value: object, default: bool = True) -> bool:
     if value is None:
         return default
@@ -358,6 +382,7 @@ def launch_app_detached(
     audio_only: bool = False,
     quality: str = "best",
     extra_args: list[str] | None = None,
+    audio_format: str = "aac",
 ) -> None:
     """Start TubeSave in a new process (used by the native messaging host)."""
     extra: list[str]
@@ -369,6 +394,8 @@ def launch_app_detached(
             f"url={quote(url, safe='')}&auto={1 if auto_start else 0}"
             f"&audio={1 if audio_only else 0}&quality={quote(quality or 'best', safe='')}"
         )
+        if audio_format:
+            protocol += f"&audio_format={quote(_normalize_audio_format(audio_format), safe='')}"
         extra = [protocol]
     else:
         extra = []
@@ -415,7 +442,11 @@ def run_native_host() -> None:
     url = str(data.get("url") or "").strip()
     action = str(data.get("action") or "").strip().lower()
     auto = _as_bool(data.get("auto", data.get("auto_start", True)), True)
-    audio = _as_bool(data.get("audio", data.get("audio_only")), "music.yandex." in url.lower())
+    audio, audio_format = _split_audio(
+        data.get("audio", data.get("audio_only")),
+        data.get("audio_format", data.get("format")),
+        url,
+    )
     quality = _normalize_quality(data.get("quality") or "best")
     if action == "update":
         if is_bridge_alive():
@@ -424,10 +455,10 @@ def run_native_host() -> None:
             launch_app_detached(extra_args=["tubesave://update"])
             payload = {"ok": True, "launched": True, "action": "update"}
     elif is_bridge_alive():
-        ok = try_handoff(url, auto, audio, quality) if url else try_focus()
+        ok = try_handoff(url, auto, audio, quality, audio_format) if url else try_focus()
         payload = {"ok": True, "alive": True, "handed": bool(ok)}
     else:
-        launch_app_detached(url, auto, audio, quality)
+        launch_app_detached(url, auto, audio, quality, audio_format=audio_format)
         payload = {"ok": True, "launched": True}
 
     raw = json.dumps(payload).encode("utf-8")
@@ -436,18 +467,18 @@ def run_native_host() -> None:
     sys.stdout.buffer.flush()
 
 
-def parse_incoming_arg(raw: str) -> tuple[str | None, bool, bool, str]:
+def parse_incoming_arg(raw: str) -> tuple[str | None, bool, bool, str, str]:
     """
-    Parse CLI / protocol argument into (url, auto_start, audio_only, quality).
+    Parse CLI / protocol argument into (url, auto_start, audio_only, quality, audio_format).
     Supports:
       https://...
-      tubesave://download?url=...&audio=1&quality=1080
+      tubesave://download?url=...&audio=1&quality=1080&audio_format=mp3
       tubesave://add?url=...&auto=0
       tubesave://https://...
     """
     text = (raw or "").strip().strip('"')
     if not text:
-        return None, True, False, "best"
+        return None, True, False, "best", ""
 
     lower = text.lower()
     if lower.startswith("tubesave:"):
@@ -456,25 +487,26 @@ def parse_incoming_arg(raw: str) -> tuple[str | None, bool, bool, str]:
             rest = rest[2:]
         if rest.lower().startswith(("http://", "https://")):
             audio = "music.yandex." in rest.lower()
-            return rest, True, audio, "best"
+            return rest, True, audio, "best", ""
         query = rest.split("?", 1)[1] if "?" in rest else ""
         qs = parse_qs(query)
         url = (qs.get("url") or [None])[0]
         if not url:
-            return None, True, False, "best"
+            return None, True, False, "best", ""
         url = unquote(url)
         auto = _as_bool((qs.get("auto") or qs.get("auto_start") or ["1"])[0], True)
-        audio = _as_bool(
+        audio, audio_format = _split_audio(
             (qs.get("audio") or qs.get("audio_only") or [None])[0],
-            default="music.yandex." in url.lower(),
+            (qs.get("audio_format") or qs.get("afmt") or [None])[0],
+            url,
         )
         quality = _normalize_quality((qs.get("quality") or qs.get("q") or ["best"])[0])
-        return url, auto, audio, quality
+        return url, auto, audio, quality, audio_format
 
     if lower.startswith("http://") or lower.startswith("https://"):
-        return text, True, "music.yandex." in lower, "best"
+        return text, True, "music.yandex." in lower, "best", ""
 
-    return None, True, False, "best"
+    return None, True, False, "best", ""
 
 
 def is_update_launch(raw: str) -> bool:
@@ -490,13 +522,13 @@ def is_update_launch(raw: str) -> bool:
     return path == "update"
 
 
-def collect_launch_urls(argv: list[str] | None = None) -> list[tuple[str, bool, bool, str]]:
+def collect_launch_urls(argv: list[str] | None = None) -> list[tuple[str, bool, bool, str, str]]:
     args = list(sys.argv[1:] if argv is None else argv)
-    found: list[tuple[str, bool, bool, str]] = []
+    found: list[tuple[str, bool, bool, str, str]] = []
     for arg in args:
-        url, auto, audio, quality = parse_incoming_arg(arg)
+        url, auto, audio, quality, audio_format = parse_incoming_arg(arg)
         if url:
-            found.append((url, auto, audio, quality))
+            found.append((url, auto, audio, quality, audio_format))
     return found
 
 
@@ -505,16 +537,18 @@ def try_handoff(
     auto_start: bool = True,
     audio_only: bool = False,
     quality: str = "best",
+    audio_format: str = "aac",
 ) -> bool:
     """Send URL to an already running TubeSave. Returns True on success."""
-    payload = json.dumps(
-        {
-            "url": url,
-            "auto_start": auto_start,
-            "audio_only": audio_only,
-            "quality": _normalize_quality(quality),
-        }
-    ).encode("utf-8")
+    body = {
+        "url": url,
+        "auto_start": auto_start,
+        "audio_only": audio_only,
+        "quality": _normalize_quality(quality),
+    }
+    if audio_format:
+        body["audio_format"] = _normalize_audio_format(audio_format)
+    payload = json.dumps(body).encode("utf-8")
     req = Request(
         f"{BRIDGE_BASE}/download",
         data=payload,
@@ -643,9 +677,10 @@ class _BridgeHandler(BaseHTTPRequestHandler):
             qs = parse_qs(parsed.query)
             url = (qs.get("url") or [""])[0].strip()
             auto = _as_bool((qs.get("auto") or qs.get("auto_start") or ["1"])[0], True)
-            audio = _as_bool(
+            audio, audio_format = _split_audio(
                 (qs.get("audio") or qs.get("audio_only") or [None])[0],
-                default="music.yandex." in url.lower(),
+                (qs.get("audio_format") or qs.get("afmt") or [None])[0],
+                url,
             )
             quality = _normalize_quality((qs.get("quality") or qs.get("q") or ["best"])[0])
             cookies = (qs.get("cookies") or [""])[0]
@@ -654,7 +689,7 @@ class _BridgeHandler(BaseHTTPRequestHandler):
                 return
             cb = _BRIDGE_CALLBACKS.get("on_url")
             if cb is not None:
-                cb(url, auto, audio, quality, cookies)
+                cb(url, auto, audio, quality, cookies, audio_format)
             self._json(200, {"ok": True, "queued": True})
             return
         self._json(404, {"ok": False, "error": "not found"})
@@ -669,8 +704,11 @@ class _BridgeHandler(BaseHTTPRequestHandler):
                 qs = parse_qs(parsed.query)
                 url = (qs.get("url") or [""])[0].strip()
             auto = _as_bool(data.get("auto_start", data.get("auto", True)), True)
-            audio_default = "music.yandex." in url.lower()
-            audio = _as_bool(data.get("audio_only", data.get("audio")), audio_default)
+            audio, audio_format = _split_audio(
+                data.get("audio_only", data.get("audio")),
+                data.get("audio_format", data.get("afmt")),
+                url,
+            )
             quality = _normalize_quality(data.get("quality") or data.get("q") or "best")
             cookies = str(data.get("cookies") or "")
             if not url:
@@ -678,7 +716,7 @@ class _BridgeHandler(BaseHTTPRequestHandler):
                 return
             cb = _BRIDGE_CALLBACKS.get("on_url")
             if cb is not None:
-                cb(url, auto, audio, quality, cookies)
+                cb(url, auto, audio, quality, cookies, audio_format)
             ext_id = str(data.get("extension_id") or "").strip()
             if ext_id:
                 register_native_host([ext_id])

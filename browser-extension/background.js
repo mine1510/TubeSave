@@ -167,7 +167,7 @@ async function pingBridge() {
   }
 }
 
-async function sendToApp(url, autoStart = true, audioOnly = false, quality = "best") {
+async function sendToApp(url, autoStart = true, audioOnly = false, quality = "best", audioFormat = "") {
   const cookies = isYandexMusic(url)
     ? await yandexCookiePayload()
     : isYouTube(url)
@@ -181,6 +181,7 @@ async function sendToApp(url, autoStart = true, audioOnly = false, quality = "be
       auto_start: autoStart,
       audio_only: audioOnly || isYandexMusic(url),
       quality: quality || "best",
+      audio_format: audioFormat || "",
       extension_id: chrome.runtime.id,
       cookies,
     }),
@@ -195,14 +196,18 @@ async function sendToApp(url, autoStart = true, audioOnly = false, quality = "be
   return data;
 }
 
-function openViaProtocol(url, autoStart = true, audioOnly = false, quality = "best") {
+function openViaProtocol(url, autoStart = true, audioOnly = false, quality = "best", audioFormat = "") {
   const auto = autoStart ? "1" : "0";
   const audio = audioOnly || isYandexMusic(url) ? "1" : "0";
   const q = quality || "best";
+  const params = { url, auto, audio, quality: q };
+  if (audioFormat) {
+    params.audio_format = audioFormat;
+  }
   const page =
     chrome.runtime.getURL("launch.html") +
     "?" +
-    new URLSearchParams({ url, auto, audio, quality: q }).toString();
+    new URLSearchParams(params).toString();
   chrome.tabs.create({ url: page, active: false }, (tab) => {
     if (chrome.runtime.lastError) {
       console.warn(chrome.runtime.lastError.message);
@@ -217,7 +222,7 @@ function openViaProtocol(url, autoStart = true, audioOnly = false, quality = "be
   });
 }
 
-function sendNative(url, autoStart, audioOnly, quality) {
+function sendNative(url, autoStart, audioOnly, quality, audioFormat) {
   return new Promise((resolve, reject) => {
     if (!chrome.runtime.sendNativeMessage) {
       reject(new Error("nativeMessaging unavailable"));
@@ -230,6 +235,7 @@ function sendNative(url, autoStart, audioOnly, quality) {
         auto: autoStart ? 1 : 0,
         audio: audioOnly ? 1 : 0,
         quality: quality || "best",
+        audio_format: audioFormat || "",
       },
       (response) => {
         if (chrome.runtime.lastError) {
@@ -259,7 +265,7 @@ async function waitForBridge(timeoutMs = 25000) {
 
 async function downloadUrl(
   url,
-  { notify = true, audioOnly = false, quality = "best", protocolFired = false } = {}
+  { notify = true, audioOnly = false, quality = "best", audioFormat = "", protocolFired = false } = {}
 ) {
   if (!url || !/^https?:\/\//i.test(url)) {
     throw new Error("Нет ссылки");
@@ -275,19 +281,20 @@ async function downloadUrl(
 
   const audio = Boolean(audioOnly) || isYandexMusic(url);
   const q = quality || "best";
+  const fmt = audioFormat || "";
   if (await pingBridge()) {
-    await sendToApp(url, true, audio, q);
+    await sendToApp(url, true, audio, q, fmt);
     if (notify) {
       await setBadge("OK", "#2F6FED");
     }
-    return { mode: "bridge", audio_only: audio, quality: q };
+    return { mode: "bridge", audio_only: audio, quality: q, audio_format: fmt };
   }
 
   async function launchApp() {
     let mode = "protocol";
     let launched = false;
     try {
-      const native = await sendNative(url, true, audio, q);
+      const native = await sendNative(url, true, audio, q, fmt);
       if (native && native.ok) {
         mode = "native";
         launched = true;
@@ -296,7 +303,7 @@ async function downloadUrl(
       // Host is registered only after TubeSave has been opened at least once.
     }
     if (!launched) {
-      openViaProtocol(url, true, audio, q);
+      openViaProtocol(url, true, audio, q, fmt);
     }
     return mode;
   }
@@ -312,11 +319,11 @@ async function downloadUrl(
       "Не удалось запустить TubeSave. Откройте приложение один раз, затем нажмите «Скачать» снова."
     );
   }
-  await sendToApp(url, true, audio, q);
+  await sendToApp(url, true, audio, q, fmt);
   if (notify) {
     await setBadge("OK", "#2F6FED");
   }
-  return { mode, audio_only: audio, quality: q };
+  return { mode, audio_only: audio, quality: q, audio_format: fmt };
 }
 
 async function setBadge(text, color) {
@@ -353,6 +360,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   downloadUrl(message.url || "", {
     audioOnly: Boolean(message.audio_only),
     quality: message.quality || "best",
+    audioFormat: message.audio_format || "",
     protocolFired: Boolean(message.protocol_fired),
   })
     .then((result) => sendResponse({ ok: true, ...result }))

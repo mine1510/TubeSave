@@ -12,7 +12,8 @@
           const auto = params.get("auto") || "1";
           const audio = params.get("audio") || "0";
           const quality = params.get("quality") || "best";
-          return (
+          const audioFormat = params.get("audio_format") || "";
+          let href =
             "tubesave://download?url=" +
             encodeURIComponent(url) +
             "&auto=" +
@@ -20,8 +21,11 @@
             "&audio=" +
             encodeURIComponent(audio) +
             "&quality=" +
-            encodeURIComponent(quality)
-          );
+            encodeURIComponent(quality);
+          if (audioFormat) {
+            href += "&audio_format=" + encodeURIComponent(audioFormat);
+          }
+          return href;
         })();
   if (!href) {
     return;

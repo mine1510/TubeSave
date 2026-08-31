@@ -1,13 +1,16 @@
 (() => {
-  function protocolHref(url, audioOnly, quality) {
-    return (
+  function protocolHref(url, audioOnly, quality, audioFormat) {
+    let href =
       "tubesave://download?url=" +
       encodeURIComponent(url) +
       "&auto=1&audio=" +
       (audioOnly ? "1" : "0") +
       "&quality=" +
-      encodeURIComponent(quality || "best")
-    );
+      encodeURIComponent(quality || "best");
+    if (audioOnly && audioFormat) {
+      href += "&audio_format=" + encodeURIComponent(audioFormat);
+    }
+    return href;
   }
 
   function isAppAliveSync() {
@@ -25,11 +28,11 @@
     }
   }
 
-  window.TubeSaveLaunchProtocol = function TubeSaveLaunchProtocol(url, audioOnly, quality) {
+  window.TubeSaveLaunchProtocol = function TubeSaveLaunchProtocol(url, audioOnly, quality, audioFormat) {
     if (!url || isAppAliveSync()) {
       return false;
     }
-    const href = protocolHref(url, audioOnly, quality);
+    const href = protocolHref(url, audioOnly, quality, audioFormat);
     const a = document.createElement("a");
     a.href = href;
     a.rel = "noreferrer";

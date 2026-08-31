@@ -31,12 +31,13 @@
     }, 1400);
   }
 
-  async function sendDownload(url, audioOnly, quality) {
+  async function sendDownload(url, audioOnly, quality, audioFormat) {
     return chrome.runtime.sendMessage({
       type: "tubesave-download",
       url,
       audio_only: Boolean(audioOnly),
       quality: quality || "best",
+      audio_format: audioFormat || "",
       protocol_fired: true,
     });
   }
@@ -100,7 +101,7 @@
     });
     let format = "mp4";
 
-    function startDownload(audioOnly, quality) {
+    function startDownload(audioOnly, quality, audioFormat) {
       const url = getUrl();
       closeMenu();
       if (!url) {
@@ -108,13 +109,14 @@
         return;
       }
       if (window.TubeSaveLaunchProtocol) {
-        window.TubeSaveLaunchProtocol(url, audioOnly, quality);
+        window.TubeSaveLaunchProtocol(url, audioOnly, quality, audioFormat);
       }
       flash(anchor, "Запуск…", "#C45C26");
-      sendDownload(url, audioOnly, quality)
+      sendDownload(url, audioOnly, quality, audioFormat)
         .then((response) => {
           if (response && response.ok) {
-            flash(anchor, audioOnly ? "AAC" : "Отправлено", "#1B7F4B");
+            const okLabel = audioOnly ? (audioFormat === "mp3" ? "MP3" : "AAC") : "Отправлено";
+            flash(anchor, okLabel, "#1B7F4B");
           } else {
             flash(anchor, "Ошибка", "#B00020");
             console.warn(response && response.error);
@@ -139,13 +141,17 @@
         fontWeight: "600",
         fontSize: "12px",
         color: "#fff",
-        background: code === "aac" ? "#C45C26" : "#2F6FED",
+        background: code === "mp4" ? "#2F6FED" : "#C45C26",
       });
       chip.addEventListener("click", (ev) => {
         ev.preventDefault();
         ev.stopPropagation();
         if (code === "aac") {
-          startDownload(true, "best");
+          startDownload(true, "best", "aac");
+          return;
+        }
+        if (code === "mp3") {
+          startDownload(true, "best", "mp3");
           return;
         }
         format = "mp4";
@@ -154,6 +160,7 @@
     }
     formatRow.appendChild(formatChip("mp4", "MP4"));
     formatRow.appendChild(formatChip("aac", "AAC"));
+    formatRow.appendChild(formatChip("mp3", "MP3"));
     menu.appendChild(formatRow);
 
     const qualityBlock = document.createElement("div");
@@ -180,7 +187,7 @@
     menu.appendChild(qualityBlock);
 
     const aacHint = document.createElement("div");
-    aacHint.textContent = "AAC сразу качает только звук (M4A)";
+    aacHint.textContent = "AAC — звук M4A. MP3 перекодируется из AAC.";
     Object.assign(aacHint.style, {
       color: "#A8A29E",
       fontSize: "11px",

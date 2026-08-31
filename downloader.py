@@ -404,6 +404,18 @@ def get_impersonate_target():
     return _IMPERSONATE_TARGET
 
 
+_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp"}
+_AUDIO_SUFFIXES = {".m4a", ".mp3", ".aac", ".opus", ".ogg", ".wav", ".flac"}
+_MAX_TAG_CHARS = 4000
+
+
+def normalize_audio_format(value: object | None) -> str:
+    text = str(value or "aac").strip().lower().lstrip(".")
+    if text in {"mp3", "mpeg", "mpga"}:
+        return "mp3"
+    return "aac"
+
+
 def _find_sidecar_thumbnail(video_path: Path) -> Path | None:
     stem = video_path.with_suffix("")
     for ext in (".jpg", ".jpeg", ".png", ".webp"):
@@ -419,38 +431,136 @@ def _find_sidecar_thumbnail(video_path: Path) -> Path | None:
     return matches[0] if matches else None
 
 
-def embed_thumbnail(
-    video_path: Path,
-    thumb_path: Path | None = None,
-    cancel_event: Event | None = None,
-) -> Path:
-    """Embed cover art so players/Explorer can show a preview."""
-    thumb = thumb_path or _find_sidecar_thumbnail(video_path)
-    if thumb is None or not video_path.exists():
-        return video_path
+def _info_text(info: dict, *keys: str) -> str:
+    for key in keys:
+        val = info.get(key)
+        if isinstance(val, (list, tuple)):
+            parts: list[str] = []
+            for item in val:
+                if isinstance(item, dict):
+                    name = str(item.get("name") or item.get("text") or "").strip()
+                else:
+                    name = str(item or "").strip()
+                if name:
+                    parts.append(name)
+            if parts:
+                return ", ".join(parts)
+            continue
+        text = str(val or "").strip()
+        if text:
+            return text
+    return ""
 
+
+def _truncate_tag(text: str, limit: int = _MAX_TAG_CHARS) -> str:
+    text = (text or "").strip()
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1].rstrip() + "…"
+
+
+def _single_line(text: str) -> str:
+    return re.sub(r"[\r\n]+", " / ", text).strip()
+
+
+def _author_url_from_info(info: dict) -> str:
+    url = _info_text(info, "channel_url", "uploader_url", "artist_url", "creator_url")
+    if url:
+        return url
+    extractor = _info_text(info, "extractor_key", "extractor", "ie_key").lower()
+    channel_id = _info_text(info, "channel_id")
+    if channel_id.startswith("UC") and "youtube" in extractor:
+        return f"https://www.youtube.com/channel/{channel_id}"
+    uploader_id = _info_text(info, "uploader_id")
+    if uploader_id.startswith("@") and "youtube" in extractor:
+        return f"https://www.youtube.com/{uploader_id}"
+    if uploader_id and "youtube" in extractor:
+        return f"https://www.youtube.com/@{uploader_id}"
+    return ""
+
+
+def _format_tag_date(raw: str) -> str:
+    text = (raw or "").strip()
+    if len(text) == 8 and text.isdigit():
+        return f"{text[:4]}-{text[4:6]}-{text[6:]}"
+    if len(text) == 4 and text.isdigit():
+        return text
+    return text
+
+
+def metadata_tags_from_info(info: dict | None) -> dict[str, str]:
+    """Title, artist, description and author URL for ffmpeg/ffmetadata."""
+    if not info:
+        return {}
+    title = _info_text(info, "track", "title")
+    artist = _info_text(info, "artist", "artists", "creator", "channel", "uploader")
+    album = _info_text(info, "album", "playlist_title")
+    description = _truncate_tag(_single_line(_info_text(info, "description")))
+    author_url = _author_url_from_info(info)
+    webpage = _info_text(info, "webpage_url", "original_url")
+    date = _format_tag_date(_info_text(info, "release_date", "upload_date"))
+    genre = _info_text(info, "genre")
+
+    comment_parts: list[str] = []
+    if author_url:
+        comment_parts.append(author_url)
+    if description:
+        comment_parts.append(description)
+
+    tags: dict[str, str] = {}
+    if title:
+        tags["title"] = title
+    if artist:
+        tags["artist"] = artist
+        tags["album_artist"] = artist
+    if album:
+        tags["album"] = album
+    if date:
+        tags["date"] = date
+    if genre:
+        tags["genre"] = genre
+    if description:
+        tags["description"] = description
+        tags["synopsis"] = description
+    if comment_parts:
+        tags["comment"] = " — ".join(comment_parts)
+    if author_url:
+        tags["copyright"] = author_url
+        tags["purl"] = author_url
+    elif webpage:
+        tags["purl"] = webpage
+    return tags
+
+
+def _escape_ffmetadata(value: str) -> str:
+    return (
+        value.replace("\\", "\\\\")
+        .replace("=", "\\=")
+        .replace(";", "\\;")
+        .replace("#", "\\#")
+        .replace("\r\n", "\n")
+        .replace("\r", "\n")
+        .replace("\n", "\\\n")
+    )
+
+
+def _write_ffmetadata(path: Path, tags: dict[str, str]) -> None:
+    lines = [";FFMETADATA1"]
+    for key, raw in tags.items():
+        value = _truncate_tag(str(raw or "").strip())
+        if not value:
+            continue
+        lines.append(f"{key}={_escape_ffmetadata(value)}")
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _run_ffmpeg_replace(
+    cmd: list[str],
+    dest: Path,
+    temp_out: Path,
+    cancel_event: Event | None,
+) -> bool:
     _check_cancel(cancel_event)
-    ffmpeg = get_ffmpeg_location()
-    temp_out = video_path.with_name(video_path.stem + ".thumb.tmp" + video_path.suffix)
-    cmd = [
-        ffmpeg,
-        "-y",
-        "-i",
-        str(video_path),
-        "-i",
-        str(thumb),
-        "-map",
-        "0",
-        "-map",
-        "1",
-        "-c",
-        "copy",
-        "-c:v:1",
-        "mjpeg",
-        "-disposition:v:1",
-        "attached_pic",
-        str(temp_out),
-    ]
     proc = subprocess.Popen(
         cmd,
         stdout=subprocess.DEVNULL,
@@ -470,18 +580,179 @@ def embed_thumbnail(
                 temp_out.unlink(missing_ok=True)
                 raise DownloadCancelled("Загрузка отменена") from None
     if proc.returncode == 0 and temp_out.exists() and temp_out.stat().st_size > 0:
-        video_path.unlink(missing_ok=True)
-        temp_out.rename(video_path)
-    else:
-        temp_out.unlink(missing_ok=True)
+        dest.unlink(missing_ok=True)
+        temp_out.rename(dest)
+        return True
+    temp_out.unlink(missing_ok=True)
+    return False
 
+
+def _ffmpeg_embed_cmd(
+    ffmpeg: str,
+    src: Path,
+    dest: Path,
+    *,
+    thumb: Path | None,
+    meta_file: Path | None,
+) -> list[str]:
+    cmd = [ffmpeg, "-y", "-i", str(src)]
+    next_idx = 1
+    thumb_idx: int | None = None
+    meta_idx: int | None = None
+    if thumb is not None:
+        cmd += ["-i", str(thumb)]
+        thumb_idx = next_idx
+        next_idx += 1
+    if meta_file is not None:
+        cmd += ["-f", "ffmetadata", "-i", str(meta_file)]
+        meta_idx = next_idx
+
+    is_audio = src.suffix.lower() in _AUDIO_SUFFIXES
+    if thumb_idx is not None and is_audio:
+        cmd += [
+            "-map",
+            "0:a",
+            "-map",
+            str(thumb_idx),
+            "-c:a",
+            "copy",
+            "-c:v",
+            "mjpeg",
+            "-disposition:v",
+            "attached_pic",
+            "-metadata:s:v",
+            "title=Album cover",
+            "-metadata:s:v",
+            "comment=Cover (front)",
+        ]
+    elif thumb_idx is not None:
+        cmd += [
+            "-map",
+            "0",
+            "-map",
+            str(thumb_idx),
+            "-c",
+            "copy",
+            "-c:v:1",
+            "mjpeg",
+            "-disposition:v:1",
+            "attached_pic",
+        ]
+    else:
+        cmd += ["-map", "0", "-c", "copy"]
+
+    if meta_idx is not None:
+        cmd += ["-map_metadata", str(meta_idx)]
+    if dest.suffix.lower() == ".mp3":
+        cmd += ["-id3v2_version", "3"]
+    cmd.append(str(dest))
+    return cmd
+
+
+def transcode_to_mp3(
+    src: Path,
+    cancel_event: Event | None = None,
+) -> Path:
+    """Re-encode AAC/M4A (or any audio) to MP3. YouTube never serves MP3 natively."""
+    if src.suffix.lower() == ".mp3":
+        return src
+    if not src.exists():
+        raise RuntimeError("Нет аудиофайла для перекодирования в MP3.")
+
+    dest = src.with_suffix(".mp3")
+    temp_out = src.with_name(src.stem + ".transcode.tmp.mp3")
+    ffmpeg = get_ffmpeg_location()
+    for encoder in ("libmp3lame", "mp3"):
+        cmd = [
+            ffmpeg,
+            "-y",
+            "-i",
+            str(src),
+            "-vn",
+            "-map",
+            "0:a:0",
+            "-c:a",
+            encoder,
+            "-b:a",
+            "320k",
+            str(temp_out),
+        ]
+        if _run_ffmpeg_replace(cmd, dest, temp_out, cancel_event):
+            if src.resolve() != dest.resolve():
+                src.unlink(missing_ok=True)
+            return dest
+    raise RuntimeError(
+        "Не удалось перекодировать в MP3.\n"
+        "Встроенный ffmpeg не смог закодировать MPEG Layer III."
+    )
+
+
+def _cleanup_sidecar_images(video_path: Path, thumb: Path | None) -> None:
     for leftover in video_path.parent.glob(video_path.stem + ".*"):
-        if leftover.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}:
+        if leftover.suffix.lower() in _IMAGE_SUFFIXES:
             leftover.unlink(missing_ok=True)
-    if thumb.exists() and thumb.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}:
+    if thumb is not None and thumb.exists() and thumb.suffix.lower() in _IMAGE_SUFFIXES:
         if thumb.parent == video_path.parent:
             thumb.unlink(missing_ok=True)
 
+
+def embed_thumbnail(
+    video_path: Path,
+    thumb_path: Path | None = None,
+    cancel_event: Event | None = None,
+    info: dict | None = None,
+) -> Path:
+    """Embed cover art and tags (description, author URL) for players/Explorer."""
+    if not video_path.exists():
+        return video_path
+
+    thumb = thumb_path or _find_sidecar_thumbnail(video_path)
+    tags = metadata_tags_from_info(info)
+    if thumb is None and not tags:
+        return video_path
+
+    _check_cancel(cancel_event)
+    ffmpeg = get_ffmpeg_location()
+    temp_out = video_path.with_name(video_path.stem + ".thumb.tmp" + video_path.suffix)
+    meta_file = video_path.with_name(video_path.stem + ".ffmetadata") if tags else None
+    try:
+        if meta_file is not None:
+            _write_ffmetadata(meta_file, tags)
+
+        combined_ok = False
+        if thumb is not None and meta_file is not None:
+            combined_ok = _run_ffmpeg_replace(
+                _ffmpeg_embed_cmd(
+                    ffmpeg, video_path, temp_out, thumb=thumb, meta_file=meta_file
+                ),
+                video_path,
+                temp_out,
+                cancel_event,
+            )
+        if not combined_ok:
+            if thumb is not None:
+                _run_ffmpeg_replace(
+                    _ffmpeg_embed_cmd(
+                        ffmpeg, video_path, temp_out, thumb=thumb, meta_file=None
+                    ),
+                    video_path,
+                    temp_out,
+                    cancel_event,
+                )
+            if meta_file is not None:
+                _run_ffmpeg_replace(
+                    _ffmpeg_embed_cmd(
+                        ffmpeg, video_path, temp_out, thumb=None, meta_file=meta_file
+                    ),
+                    video_path,
+                    temp_out,
+                    cancel_event,
+                )
+    finally:
+        if meta_file is not None:
+            meta_file.unlink(missing_ok=True)
+
+    _cleanup_sidecar_images(video_path, thumb)
     return video_path
 
 
@@ -899,6 +1170,7 @@ def build_ydl_opts(
     *,
     audio_only: bool = False,
     quality: str = "best",
+    audio_format: str = "aac",
     site: str | None = None,
     cancel_event: Event | None = None,
     cleanup: DownloadCleanup | None = None,
@@ -932,12 +1204,13 @@ def build_ydl_opts(
         ],
     }
 
+    want_mp3 = audio_only and normalize_audio_format(audio_format) == "mp3"
     if audio_only:
         opts["postprocessors"].append(
             {
                 "key": "FFmpegExtractAudio",
-                "preferredcodec": "m4a",
-                "preferredquality": "0",
+                "preferredcodec": "mp3" if want_mp3 else "m4a",
+                "preferredquality": "320" if want_mp3 else "0",
             }
         )
     else:
@@ -978,7 +1251,9 @@ def build_ydl_opts(
                 if postprocessor == "Merger":
                     status_callback("Объединение видео и аудио…")
                 elif postprocessor == "FFmpegExtractAudio":
-                    status_callback("Извлечение аудио…")
+                    status_callback(
+                        "Перекодирование в MP3…" if want_mp3 else "Извлечение аудио…"
+                    )
                 elif postprocessor == "FFmpegThumbnailsConvertor":
                     status_callback("Подготовка превью…")
                 elif postprocessor == "FFmpegVideoConvertor":
@@ -1086,21 +1361,29 @@ def _resolve_output_path(
     info: dict,
     *,
     audio_only: bool = False,
+    audio_format: str = "aac",
 ) -> Path:
     filepath = Path(ydl.prepare_filename(info))
     if audio_only:
-        for ext in (".m4a", ".mp3", ".aac", ".opus", ".ogg", ".wav"):
+        preferred = (".mp3",) if normalize_audio_format(audio_format) == "mp3" else (".m4a", ".aac")
+        others = (".m4a", ".mp3", ".aac", ".opus", ".ogg", ".wav", ".flac")
+        exts = list(preferred) + [ext for ext in others if ext not in preferred]
+        for ext in exts:
             candidate = filepath.with_suffix(ext)
             if candidate.exists():
                 return candidate
         # After extract, original media may be deleted; search by id/title stem.
         stem = filepath.with_suffix("").name
         matches = sorted(filepath.parent.glob(stem + ".*"))
+        preferred_set = set(preferred)
         audio_matches = [
             path
             for path in matches
-            if path.suffix.lower() in {".m4a", ".mp3", ".aac", ".opus", ".ogg", ".wav"}
+            if path.suffix.lower() in set(others)
         ]
+        preferred_matches = [path for path in audio_matches if path.suffix.lower() in preferred_set]
+        if preferred_matches:
+            return preferred_matches[0]
         if audio_matches:
             return audio_matches[0]
         return filepath
@@ -1112,24 +1395,38 @@ def _resolve_output_path(
     return filepath
 
 
+def _unwrap_info(info: dict | None) -> dict:
+    if not info:
+        raise RuntimeError("Не удалось получить информацию о видео.")
+    if info.get("_type") == "playlist":
+        for entry in info.get("entries") or []:
+            if entry:
+                return entry
+    return info
+
+
 def _try_download(
     url: str,
     opts: dict,
     report: Callable[[str], None] | None = None,
     *,
     audio_only: bool = False,
+    audio_format: str = "aac",
     cancel_event: Event | None = None,
-) -> Path:
+) -> tuple[Path, dict]:
     _check_cancel(cancel_event)
     if report is not None:
         report("Получение информации о видео…")
     try:
         with _youtube_dl(opts) as ydl:
-            info = ydl.extract_info(url, download=True)
+            info = _unwrap_info(ydl.extract_info(url, download=True))
             _check_cancel(cancel_event)
-            if info is None:
-                raise RuntimeError("Не удалось получить информацию о видео.")
-            return _resolve_output_path(ydl, info, audio_only=audio_only)
+            return (
+                _resolve_output_path(
+                    ydl, info, audio_only=audio_only, audio_format=audio_format
+                ),
+                info,
+            )
     except DownloadCancelled:
         raise
     except Exception as exc:
@@ -1138,11 +1435,14 @@ def _try_download(
             retry_opts.pop("impersonate", None)
             try:
                 with _youtube_dl(retry_opts) as ydl:
-                    info = ydl.extract_info(url, download=True)
+                    info = _unwrap_info(ydl.extract_info(url, download=True))
                     _check_cancel(cancel_event)
-                    if info is None:
-                        raise RuntimeError("Не удалось получить информацию о видео.")
-                    return _resolve_output_path(ydl, info, audio_only=audio_only)
+                    return (
+                        _resolve_output_path(
+                            ydl, info, audio_only=audio_only, audio_format=audio_format
+                        ),
+                        info,
+                    )
             except DownloadCancelled:
                 raise
             except Exception as retry_exc:
@@ -1652,6 +1952,45 @@ def _download_binary(
         progress_hook({"status": "finished", "filename": str(dest)})
 
 
+def _yandex_info_from_track(
+    track: dict,
+    page_url: str,
+    *,
+    artist: str = "",
+    title: str = "",
+) -> dict:
+    artists = track.get("artists") or []
+    artist_url = ""
+    for item in artists:
+        if isinstance(item, dict) and item.get("id"):
+            artist_url = f"https://music.yandex.ru/artist/{item['id']}"
+            break
+    albums = track.get("albums") or []
+    album0 = albums[0] if albums and isinstance(albums[0], dict) else {}
+    album_title = str(album0.get("title") or "").strip()
+    version = str(track.get("version") or "").strip()
+    display_title = title or str(track.get("title") or "")
+    if version and version.lower() not in display_title.lower():
+        display_title = f"{display_title} ({version})"
+    description_parts: list[str] = []
+    if album_title:
+        description_parts.append(album_title)
+    if version:
+        description_parts.append(version)
+    year = album0.get("year")
+    upload_date = f"{year}0101" if year else ""
+    return {
+        "title": display_title,
+        "artist": artist,
+        "album": album_title,
+        "genre": str(album0.get("genre") or ""),
+        "description": "\n".join(description_parts),
+        "channel_url": artist_url,
+        "webpage_url": page_url,
+        "upload_date": upload_date,
+    }
+
+
 def download_yandex_music(
     url: str,
     output_dir: Path,
@@ -1660,6 +1999,7 @@ def download_yandex_music(
     *,
     cookies: str = "",
     cancel_event: Event | None = None,
+    audio_format: str = "aac",
 ) -> Path:
     track_id = parse_yandex_track_id(url)
     if not track_id:
@@ -1711,6 +2051,7 @@ def download_yandex_music(
             cover = str(albums[0].get("coverUri") or track.get("coverUri") or "")
         else:
             cover = str(track.get("coverUri") or "")
+        thumb: Path | None = None
         if cover:
             if not cover.startswith("http"):
                 cover = "https://" + cover.replace("%%", "400x400")
@@ -1719,13 +2060,24 @@ def download_yandex_music(
             thumb = dest.with_suffix(".jpg")
             cleanup.track(thumb)
             try:
-                report("Встраивание превью…")
+                report("Загрузка обложки…")
                 _download_binary(cover, thumb, headers, None, cancel_event)
-                embed_thumbnail(dest, thumb, cancel_event)
             except DownloadCancelled:
                 raise
             except Exception:
                 thumb.unlink(missing_ok=True)
+                thumb = None
+        if normalize_audio_format(audio_format) == "mp3" and dest.suffix.lower() != ".mp3":
+            report("Перекодирование AAC → MP3…")
+            dest = transcode_to_mp3(dest, cancel_event)
+            cleanup.track(dest)
+        report("Превью и метаданные…")
+        embed_thumbnail(
+            dest,
+            thumb,
+            cancel_event,
+            info=_yandex_info_from_track(track, url, artist=artist, title=title),
+        )
         return dest
     except DownloadCancelled:
         cleanup.purge()
@@ -1815,6 +2167,7 @@ def download_video(
     *,
     audio_only: bool = False,
     quality: str = "best",
+    audio_format: str = "aac",
     cookies: str = "",
     cancel_event: Event | None = None,
 ) -> Path:
@@ -1824,6 +2177,7 @@ def download_video(
         raise ValueError(
             "Неподдерживаемая ссылка. Доступны:\n" + SUPPORTED_SITES_HINT
         )
+    audio_format = normalize_audio_format(audio_format)
     # Yandex Music tracks are audio — always extract M4A/MP3.
     if site == "yandexmusic":
         return download_yandex_music(
@@ -1833,6 +2187,7 @@ def download_video(
             status_callback,
             cookies=cookies,
             cancel_event=cancel_event,
+            audio_format=audio_format,
         )
 
     def report(message: str) -> None:
@@ -1850,6 +2205,7 @@ def download_video(
             status_callback,
             audio_only=audio_only,
             quality=quality,
+            audio_format=audio_format,
             site=site,
             cancel_event=cancel_event,
             cleanup=cleanup,
@@ -1863,13 +2219,19 @@ def download_video(
 
         last_error: Exception | None = None
         filepath: Path | None = None
+        info: dict = {}
         for attempt in range(1, 4):
             try:
                 if attempt > 1:
                     report(f"Повтор скачивания ({attempt}/3)…")
                     _interruptible_sleep(1.5 * attempt, cancel_event)
-                filepath = _try_download(
-                    url, opts, report, audio_only=audio_only, cancel_event=cancel_event
+                filepath, info = _try_download(
+                    url,
+                    opts,
+                    report,
+                    audio_only=audio_only,
+                    audio_format=audio_format,
+                    cancel_event=cancel_event,
                 )
                 break
             except DownloadCancelled:
@@ -1898,11 +2260,12 @@ def download_video(
                         opts = _with_youtube_authed_clients(opts)
                         youtube_used_cookies = True
                         try:
-                            filepath = _try_download(
+                            filepath, info = _try_download(
                                 url,
                                 opts,
                                 report,
                                 audio_only=audio_only,
+                                audio_format=audio_format,
                                 cancel_event=cancel_event,
                             )
                             break
@@ -1931,8 +2294,13 @@ def download_video(
                     _apply_youtube_cookies(fallback, youtube_cookie_file)
                     fallback = _with_youtube_authed_clients(fallback)
             try:
-                filepath = _try_download(
-                    url, fallback, report, audio_only=audio_only, cancel_event=cancel_event
+                filepath, info = _try_download(
+                    url,
+                    fallback,
+                    report,
+                    audio_only=audio_only,
+                    audio_format=audio_format,
+                    cancel_event=cancel_event,
                 )
             except DownloadCancelled:
                 raise
@@ -1947,11 +2315,12 @@ def download_video(
                         audio_only=audio_only, quality=quality
                     )
                     try:
-                        filepath = _try_download(
+                        filepath, info = _try_download(
                             url,
                             bare,
                             report,
                             audio_only=audio_only,
+                            audio_format=audio_format,
                             cancel_event=cancel_event,
                         )
                     except DownloadCancelled:
@@ -1969,7 +2338,15 @@ def download_video(
 
         report("Проверка результата…")
         if audio_only:
-            if filepath.suffix.lower() not in {".m4a", ".mp3", ".aac"}:
+            if audio_format == "mp3":
+                if filepath.suffix.lower() != ".mp3":
+                    mp3_path = filepath.with_suffix(".mp3")
+                    if mp3_path.exists() and mp3_path != filepath:
+                        filepath = mp3_path
+                    else:
+                        report("Перекодирование AAC → MP3…")
+                        filepath = transcode_to_mp3(filepath, cancel_event)
+            elif filepath.suffix.lower() not in {".m4a", ".mp3", ".aac"}:
                 m4a_path = filepath.with_suffix(".m4a")
                 if m4a_path.exists():
                     filepath = m4a_path
@@ -1979,10 +2356,16 @@ def download_video(
                 filepath = mp4_path
 
         cleanup.track(filepath)
-        # Cover embed is mainly useful for video/audio containers.
-        if filepath.suffix.lower() in {".mp4", ".m4a", ".mkv", ".webm", ".mp3"}:
-            report("Встраивание превью…")
-            filepath = embed_thumbnail(filepath, cancel_event=cancel_event)
+        # Cover + tags (description, author URL) for audio; cover for video.
+        if filepath.suffix.lower() in {".mp4", ".m4a", ".mkv", ".webm", ".mp3", ".aac"}:
+            if audio_only:
+                report("Превью и метаданные…")
+                filepath = embed_thumbnail(
+                    filepath, cancel_event=cancel_event, info=info
+                )
+            else:
+                report("Встраивание превью…")
+                filepath = embed_thumbnail(filepath, cancel_event=cancel_event)
         return filepath
     except DownloadCancelled:
         cleanup.purge()
