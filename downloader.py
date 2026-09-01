@@ -264,6 +264,210 @@ def is_supported_url(url: str) -> bool:
     return detect_site(url) is not None
 
 
+_URL_IN_TEXT_RE = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
+
+
+def extract_media_urls(text: str) -> list[str]:
+    """Pull supported http(s) links from pasted text (spaces or newlines)."""
+    found: list[str] = []
+    seen: set[str] = set()
+    for match in _URL_IN_TEXT_RE.findall(text or ""):
+        url = match.rstrip(").,];'\"")
+        if not is_supported_url(url) or url in seen:
+            continue
+        seen.add(url)
+        found.append(url)
+    if found:
+        return found
+    stripped = (text or "").strip()
+    if stripped and is_supported_url(stripped):
+        return [stripped]
+    return []
+
+
+_HMS_TOKEN_RE = re.compile(
+    r"^(?:(?P<h>\d+)h)?(?:(?P<m>\d+)m)?(?:(?P<s>\d+(?:\.\d+)?)s)?$",
+    re.IGNORECASE,
+)
+
+
+def parse_timestamp(value: object | None) -> float | None:
+    """Parse 90, 1:20, 1:20:05, 1h2m3s. Empty / 'конец' → None."""
+    text = str(value or "").strip().replace(",", ".")
+    if not text or text.lower() in {"inf", "end", "конец", "eof"}:
+        return None
+    if re.fullmatch(r"\d+(?:\.\d+)?", text):
+        return float(text)
+    compact = text.replace(" ", "")
+    if any(ch in compact.lower() for ch in "hms"):
+        match = _HMS_TOKEN_RE.fullmatch(compact)
+        if match and compact:
+            hours = int(match.group("h") or 0)
+            minutes = int(match.group("m") or 0)
+            seconds = float(match.group("s") or 0)
+            if hours or minutes or match.group("s"):
+                return hours * 3600 + minutes * 60 + seconds
+    parts = text.split(":")
+    if 2 <= len(parts) <= 3:
+        try:
+            nums = [float(part) for part in parts]
+        except ValueError as exc:
+            raise ValueError(f"Неверное время: {text}") from exc
+        if any(n < 0 for n in nums):
+            raise ValueError(f"Неверное время: {text}")
+        if len(nums) == 2:
+            return nums[0] * 60 + nums[1]
+        return nums[0] * 3600 + nums[1] * 60 + nums[2]
+    raise ValueError(f"Неверное время: {text}")
+
+
+def normalize_time_range(
+    start: float | None,
+    end: float | None,
+) -> tuple[float | None, float | None]:
+    if start is not None and start < 0:
+        raise ValueError("Начало обрезки не может быть отрицательным.")
+    if end is not None and end < 0:
+        raise ValueError("Конец обрезки не может быть отрицательным.")
+    if start is not None and end is not None and end <= start:
+        raise ValueError("Конец обрезки должен быть позже начала.")
+    return start, end
+
+
+def format_timestamp(seconds: float | None) -> str:
+    if seconds is None:
+        return ""
+    total = max(0, int(round(float(seconds))))
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{secs:02d}"
+    return f"{minutes}:{secs:02d}"
+
+
+def time_range_label(start: float | None, end: float | None) -> str:
+    if start is None and end is None:
+        return ""
+    left = format_timestamp(start) if start is not None else "начало"
+    right = format_timestamp(end) if end is not None else "конец"
+    return f"{left}–{right}"
+
+
+def time_range_filename_suffix(start: float | None, end: float | None) -> str:
+    if start is None and end is None:
+        return ""
+    left = format_timestamp(start).replace(":", "-") if start is not None else "0-00"
+    right = format_timestamp(end).replace(":", "-") if end is not None else "end"
+    return f"{left}_{right}"
+
+
+def timestamp_from_url(url: str) -> float | None:
+    """Read YouTube-style t= / start= from the query or fragment."""
+    try:
+        parsed = urlparse(url.strip())
+    except Exception:
+        return None
+    for blob in (parsed.query, parsed.fragment or ""):
+        if not blob:
+            continue
+        query = blob if "=" in blob else f"t={blob}"
+        try:
+            qs = parse_qs(query)
+        except Exception:
+            continue
+        for key in ("t", "start", "time_continue"):
+            raw = (qs.get(key) or [""])[0]
+            if not raw:
+                continue
+            try:
+                return parse_timestamp(raw)
+            except ValueError:
+                continue
+    return None
+
+
+def apply_download_range(
+    opts: dict,
+    start: float | None,
+    end: float | None,
+) -> dict:
+    """Ask yt-dlp to fetch only [start, end]; open bound uses 0 / inf."""
+    if start is None and end is None:
+        return opts
+    from yt_dlp.utils import download_range_func
+
+    start_s = 0.0 if start is None else float(start)
+    end_s = float("inf") if end is None else float(end)
+    opts["download_ranges"] = download_range_func(None, [(start_s, end_s)])
+    opts["force_keyframes_at_cuts"] = True
+    suffix = time_range_filename_suffix(start, end)
+    if suffix:
+        output_dir = Path(str(opts.get("outtmpl") or ".")).parent
+        opts["outtmpl"] = str(output_dir / f"%(title)s [%(id)s] {suffix}.%(ext)s")
+    return opts
+
+
+def trim_existing_file(
+    src: Path,
+    start: float | None,
+    end: float | None,
+    cancel_event: Event | None = None,
+) -> Path:
+    """Cut an already downloaded file with ffmpeg (Yandex and similar)."""
+    if start is None and end is None:
+        return src
+    suffix = time_range_filename_suffix(start, end)
+    dest = src.with_name(f"{src.stem} {suffix}{src.suffix}") if suffix else src
+    ffmpeg = get_ffmpeg_location()
+    temp_out = dest.with_name(dest.stem + ".trim" + dest.suffix)
+    _unlink_quiet(temp_out)
+
+    def build_cmd(*, copy: bool) -> list[str]:
+        cmd = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error"]
+        if start:
+            cmd.extend(["-ss", f"{start:.3f}"])
+        cmd.extend(["-i", str(src)])
+        if end is not None:
+            duration = max(0.05, float(end) - float(start or 0))
+            cmd.extend(["-t", f"{duration:.3f}"])
+        if copy:
+            cmd.extend(["-c", "copy", "-avoid_negative_ts", "make_zero"])
+        elif src.suffix.lower() == ".mp3":
+            cmd.extend(["-c:a", "libmp3lame", "-q:a", "2"])
+        elif src.suffix.lower() in {".m4a", ".aac"}:
+            cmd.extend(["-c:a", "aac", "-b:a", "192k"])
+        else:
+            cmd.extend(["-c:v", "libx264", "-c:a", "aac", "-movflags", "+faststart"])
+        cmd.append(str(temp_out))
+        return cmd
+
+    if not _run_ffmpeg_replace(build_cmd(copy=True), dest, temp_out, cancel_event):
+        if not _run_ffmpeg_replace(build_cmd(copy=False), dest, temp_out, cancel_event):
+            raise RuntimeError("Не удалось обрезать файл по времени.")
+    if dest.resolve() != src.resolve():
+        _unlink_quiet(src)
+    return dest
+
+
+def short_media_label(url: str) -> str:
+    """Compact title for the download queue until the file name is known."""
+    text = (url or "").strip()
+    try:
+        parsed = urlparse(text)
+    except Exception:
+        return text[:72] or "Ссылка"
+    path = (parsed.path or "").rstrip("/")
+    host = (parsed.hostname or "").lower()
+    query = parse_qs(parsed.query or "")
+    video_id = (query.get("v") or [""])[0]
+    if video_id:
+        return video_id
+    if "/shorts/" in path.lower() or host in {"youtu.be"}:
+        return path.split("/")[-1] or text[:72]
+    name = path.split("/")[-1] if path else (parsed.netloc or text)
+    return (name or "Ссылка")[:72]
+
+
 def is_youtube_url(url: str) -> bool:
     """Backward-compatible alias."""
     return detect_site(url) == "youtube"
@@ -1180,6 +1384,8 @@ def build_ydl_opts(
     audio_format: str = "aac",
     site: str | None = None,
     url: str | None = None,
+    start_time: float | None = None,
+    end_time: float | None = None,
     cancel_event: Event | None = None,
     cleanup: DownloadCleanup | None = None,
     impersonate: bool = True,
@@ -1228,6 +1434,8 @@ def build_ydl_opts(
         # Resolution first (res:1080 caps the short side, so 1080x1920 Shorts count as 1080p).
         opts["format_sort"] = format_sort_keys(quality, url=url)
         opts["format_sort_force"] = True
+
+    apply_download_range(opts, start_time, end_time)
 
     js_runtimes = _ydl_js_runtimes()
     if js_runtimes:
@@ -2204,6 +2412,8 @@ def download_video(
     audio_format: str = "aac",
     cookies: str = "",
     cancel_event: Event | None = None,
+    start_time: float | None = None,
+    end_time: float | None = None,
 ) -> Path:
     url = url.strip()
     site = detect_site(url)
@@ -2212,9 +2422,10 @@ def download_video(
             "Неподдерживаемая ссылка. Доступны:\n" + SUPPORTED_SITES_HINT
         )
     audio_format = normalize_audio_format(audio_format)
+    start_time, end_time = normalize_time_range(start_time, end_time)
     # Yandex Music tracks are audio — always extract M4A/MP3.
     if site == "yandexmusic":
-        return download_yandex_music(
+        path = download_yandex_music(
             url,
             output_dir,
             progress_hook,
@@ -2223,6 +2434,11 @@ def download_video(
             cancel_event=cancel_event,
             audio_format=audio_format,
         )
+        if start_time is not None or end_time is not None:
+            if status_callback is not None:
+                status_callback("Обрезка по времени…")
+            return trim_existing_file(path, start_time, end_time, cancel_event)
+        return path
 
     def report(message: str) -> None:
         _check_cancel(cancel_event)
@@ -2242,6 +2458,8 @@ def download_video(
             audio_format=audio_format,
             site=site,
             url=url,
+            start_time=start_time,
+            end_time=end_time,
             cancel_event=cancel_event,
             cleanup=cleanup,
         )

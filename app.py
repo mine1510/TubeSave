@@ -17,6 +17,7 @@ import sys
 import threading
 import time
 import tkinter as tk
+from dataclasses import dataclass
 from pathlib import Path
 from tkinter import filedialog, messagebox
 
@@ -24,10 +25,16 @@ from downloader import (
     SUPPORTED_SITES_HINT,
     DownloadCancelled,
     download_video,
+    extract_media_urls,
     fetch_video_info,
     is_supported_url,
     normalize_audio_format,
+    normalize_time_range,
+    parse_timestamp,
+    short_media_label,
     site_label,
+    time_range_label,
+    timestamp_from_url,
 )
 from bridge import (
     BRIDGE_PORT,
@@ -216,6 +223,54 @@ AUDIO_FORMAT_OPTIONS: list[tuple[str, str]] = [
     ("mp3", "MP3"),
 ]
 AUDIO_FORMAT_CODES = {code for code, _label in AUDIO_FORMAT_OPTIONS}
+
+QUEUE_KEEP_FINISHED = 30
+
+
+@dataclass
+class QueueJob:
+    id: int
+    url: str
+    audio_only: bool
+    quality: str
+    audio_format: str
+    folder: Path
+    cookies: str = ""
+    quiet: bool = False
+    start_time: float | None = None
+    end_time: float | None = None
+    title: str = ""
+    status: str = "pending"  # pending | running | done | error | cancelled
+    message: str = ""
+    kind: str = "MP4"
+
+    def __post_init__(self) -> None:
+        if not self.title:
+            self.title = short_media_label(self.url)
+        if self.audio_only:
+            self.kind = "MP3" if self.audio_format == "mp3" else "AAC"
+        else:
+            self.kind = "MP4"
+
+    def quality_label(self) -> str:
+        if self.audio_only:
+            return self.kind
+        return next(
+            (label for code, label in QUALITY_OPTIONS if code == self.quality),
+            self.quality,
+        )
+
+    def trim_label(self) -> str:
+        return time_range_label(self.start_time, self.end_time)
+
+    def status_label(self) -> str:
+        return {
+            "pending": "В очереди",
+            "running": "Скачивается",
+            "done": "Готово",
+            "error": "Ошибка",
+            "cancelled": "Отменено",
+        }.get(self.status, self.status)
 
 
 def format_duration(seconds: float | None) -> str:
@@ -586,6 +641,10 @@ class YouTubeDownloaderApp(tk.Tk):
         self._update_applying = False
         self._is_downloading = False
         self._update_deferred_logged = False
+        self._queue_jobs: list[QueueJob] = []
+        self._queue_seq = 0
+        self._active_job: QueueJob | None = None
+        self._queue_rows: list[tk.Frame] = []
         self._ensure_tray()
         delay = 800 if getattr(self, "_apply_update_on_start", False) else 2500
         self.after(delay, self._check_updates_silent)
@@ -629,14 +688,14 @@ class YouTubeDownloaderApp(tk.Tk):
         """Size window so action buttons are always visible on first open."""
         self.update_idletasks()
         width = max(900, self.winfo_reqwidth())
-        height = max(720, self.winfo_reqheight() + 24)
+        height = max(780, self.winfo_reqheight() + 24)
         screen_w = self.winfo_screenwidth()
         screen_h = self.winfo_screenheight()
         width = min(width, max(640, screen_w - 80))
         height = min(height, max(560, screen_h - 100))
         x = max(0, (screen_w - width) // 2)
         y = max(0, (screen_h - height) // 3)
-        self.minsize(880, 700)
+        self.minsize(880, 760)
         self.geometry(f"{width}x{height}+{x}+{y}")
 
     def _register_pill(self, button: PillButton, parent_key: str = "bg") -> PillButton:
@@ -784,9 +843,19 @@ class YouTubeDownloaderApp(tk.Tk):
         )
         self.url_entry.pack(fill="x", pady=(6, 0), ipady=7, ipadx=8)
         self._entries.append(self.url_entry)
-        self._bind_clipboard(self.url_entry)
+        self._bind_clipboard(self.url_entry, flatten_whitespace=True)
         self.url_entry.bind("<Return>", lambda _e: self._start_download())
         self.url_entry.focus_set()
+
+        url_hint = tk.Label(
+            url_inner,
+            text="Можно вставить несколько ссылок сразу — они встанут в очередь.",
+            font=FONTS["small"],
+            fg=COLORS["muted"],
+            bg=COLORS["surface"],
+        )
+        url_hint.pack(anchor="w", pady=(6, 0))
+        self._surface_muted_labels.append(url_hint)
 
         # Folder card
         folder_card = Card(content)
@@ -860,7 +929,7 @@ class YouTubeDownloaderApp(tk.Tk):
 
         quality_hint = tk.Label(
             quality_inner,
-            text="Если выбранного разрешения нет, будет взято ближайшее доступное.",
+            text="Если выбранного разрешения нет, будет взято ближайшее доступное. Несколько ссылок — через пробел.",
             font=FONTS["small"],
             fg=COLORS["muted"],
             bg=COLORS["surface"],
@@ -909,6 +978,86 @@ class YouTubeDownloaderApp(tk.Tk):
             chip.pack(side="left", padx=(0, 8))
             chip.set_selected(code == self._audio_format)
             self._audio_format_chips.append(chip)
+
+        trim_title = tk.Label(
+            quality_inner,
+            text="Обрезка по времени",
+            font=FONTS["title"],
+            fg=COLORS["text"],
+            bg=COLORS["surface"],
+        )
+        trim_title.pack(anchor="w", pady=(12, 0))
+        self._surface_text_labels.append(trim_title)
+
+        trim_hint = tk.Label(
+            quality_inner,
+            text="Только в приложении. Пусто = целиком. Формат: 1:20, 1:20:05 или 90.",
+            font=FONTS["small"],
+            fg=COLORS["muted"],
+            bg=COLORS["surface"],
+        )
+        trim_hint.pack(anchor="w", pady=(2, 8))
+        self._surface_muted_labels.append(trim_hint)
+
+        trim_row = tk.Frame(quality_inner, bg=COLORS["surface"])
+        trim_row.pack(fill="x")
+        self._surface_frames.append(trim_row)
+
+        trim_from_label = tk.Label(
+            trim_row,
+            text="С",
+            font=FONTS["small"],
+            fg=COLORS["muted"],
+            bg=COLORS["surface"],
+        )
+        trim_from_label.pack(side="left")
+        self._surface_muted_labels.append(trim_from_label)
+
+        self.trim_start_var = tk.StringVar()
+        self.trim_start_entry = tk.Entry(
+            trim_row,
+            textvariable=self.trim_start_var,
+            font=FONTS["body"],
+            width=10,
+            bg=COLORS["ghost"],
+            fg=COLORS["text"],
+            relief="flat",
+            insertbackground=COLORS["text"],
+            highlightthickness=1,
+            highlightbackground=COLORS["border"],
+            highlightcolor=COLORS["accent"],
+        )
+        self.trim_start_entry.pack(side="left", padx=(8, 16), ipady=6, ipadx=8)
+        self._entries.append(self.trim_start_entry)
+        self._bind_clipboard(self.trim_start_entry)
+
+        trim_to_label = tk.Label(
+            trim_row,
+            text="По",
+            font=FONTS["small"],
+            fg=COLORS["muted"],
+            bg=COLORS["surface"],
+        )
+        trim_to_label.pack(side="left")
+        self._surface_muted_labels.append(trim_to_label)
+
+        self.trim_end_var = tk.StringVar()
+        self.trim_end_entry = tk.Entry(
+            trim_row,
+            textvariable=self.trim_end_var,
+            font=FONTS["body"],
+            width=10,
+            bg=COLORS["ghost"],
+            fg=COLORS["text"],
+            relief="flat",
+            insertbackground=COLORS["text"],
+            highlightthickness=1,
+            highlightbackground=COLORS["border"],
+            highlightcolor=COLORS["accent"],
+        )
+        self.trim_end_entry.pack(side="left", padx=(8, 0), ipady=6, ipadx=8)
+        self._entries.append(self.trim_end_entry)
+        self._bind_clipboard(self.trim_end_entry)
 
         # Info + progress card
         status_card = Card(content)
@@ -991,6 +1140,123 @@ class YouTubeDownloaderApp(tk.Tk):
         )
         status_label.pack(anchor="w", pady=(10, 0))
         self._surface_text_labels.append(status_label)
+
+        # Download queue
+        queue_card = Card(content)
+        queue_card.pack(fill="x", pady=(0, 10))
+        self._cards.append(queue_card)
+        queue_inner = tk.Frame(queue_card, bg=COLORS["surface"])
+        queue_inner.pack(fill="x", padx=16, pady=12)
+        self._surface_frames.append(queue_inner)
+
+        queue_header = tk.Frame(queue_inner, bg=COLORS["surface"])
+        queue_header.pack(fill="x")
+        self._surface_frames.append(queue_header)
+
+        self.queue_title_var = tk.StringVar(value="Очередь")
+        queue_title = tk.Label(
+            queue_header,
+            textvariable=self.queue_title_var,
+            font=FONTS["title"],
+            fg=COLORS["text"],
+            bg=COLORS["surface"],
+        )
+        queue_title.pack(side="left")
+        self._surface_text_labels.append(queue_title)
+
+        self.clear_done_btn = self._register_pill(
+            PillButton(
+                queue_header,
+                "Готовые",
+                self._clear_finished_jobs,
+                width=88,
+                height=28,
+            ),
+            parent_key="surface",
+        )
+        self.clear_done_btn.pack(side="right")
+
+        self.clear_queue_btn = self._register_pill(
+            PillButton(
+                queue_header,
+                "Очистить",
+                self._clear_pending_jobs,
+                width=88,
+                height=28,
+            ),
+            parent_key="surface",
+        )
+        self.clear_queue_btn.pack(side="right", padx=(0, 8))
+
+        queue_hint = tk.Label(
+            queue_inner,
+            text="Пока качается одно видео, новые ссылки ждут здесь. «Отмена» останавливает только текущее.",
+            font=FONTS["small"],
+            fg=COLORS["muted"],
+            bg=COLORS["surface"],
+        )
+        queue_hint.pack(anchor="w", pady=(4, 8))
+        self._surface_muted_labels.append(queue_hint)
+
+        queue_list_wrap = tk.Frame(queue_inner, bg=COLORS["surface"])
+        queue_list_wrap.pack(fill="x")
+        self._surface_frames.append(queue_list_wrap)
+
+        self._queue_canvas = tk.Canvas(
+            queue_list_wrap,
+            height=128,
+            highlightthickness=0,
+            bg=COLORS["ghost"],
+        )
+        self._queue_scroll = tk.Scrollbar(
+            queue_list_wrap,
+            orient="vertical",
+            command=self._queue_canvas.yview,
+        )
+        self._queue_canvas.configure(yscrollcommand=self._queue_scroll.set)
+        self._queue_canvas.pack(side="left", fill="x", expand=True)
+        self._queue_scroll.pack(side="right", fill="y")
+
+        self._queue_inner = tk.Frame(self._queue_canvas, bg=COLORS["ghost"])
+        self._queue_canvas_window = self._queue_canvas.create_window(
+            (0, 0), window=self._queue_inner, anchor="nw"
+        )
+        self._queue_inner.bind(
+            "<Configure>",
+            lambda _e: self._queue_canvas.configure(
+                scrollregion=self._queue_canvas.bbox("all")
+            ),
+        )
+        self._queue_canvas.bind(
+            "<Configure>",
+            lambda e: self._queue_canvas.itemconfigure(
+                self._queue_canvas_window, width=e.width
+            ),
+        )
+        self._queue_canvas.bind(
+            "<MouseWheel>",
+            lambda e: self._queue_canvas.yview_scroll(int(-e.delta / 120), "units"),
+        )
+        self._queue_inner.bind(
+            "<MouseWheel>",
+            lambda e: self._queue_canvas.yview_scroll(int(-e.delta / 120), "units"),
+        )
+        self._surface_frames.append(self._queue_inner)
+
+        self.queue_empty_var = tk.StringVar(
+            value="Пока пусто. Нажмите «Скачать» или кнопку в браузере."
+        )
+        self.queue_empty_label = tk.Label(
+            self._queue_inner,
+            textvariable=self.queue_empty_var,
+            font=FONTS["small"],
+            fg=COLORS["muted"],
+            bg=COLORS["ghost"],
+            anchor="w",
+            padx=10,
+            pady=12,
+        )
+        self.queue_empty_label.pack(fill="x")
 
         # Log card — expands, but never pushes buttons off-screen
         log_card = Card(content)
@@ -1126,6 +1392,9 @@ class YouTubeDownloaderApp(tk.Tk):
             )
 
         self.log_text.configure(bg=COLORS["ghost"], fg=COLORS["text"])
+        self._queue_canvas.configure(bg=COLORS["ghost"])
+        self._queue_inner.configure(bg=COLORS["ghost"])
+        self.queue_empty_label.configure(fg=COLORS["muted"], bg=COLORS["ghost"])
 
         for menu in self._context_menus:
             menu.configure(bg=COLORS["surface"], fg=COLORS["text"])
@@ -1146,6 +1415,7 @@ class YouTubeDownloaderApp(tk.Tk):
         for chip in self._audio_format_chips:
             chip.configure(bg=COLORS["surface"])
             chip.set_selected(chip.code == self._audio_format)
+        self._refresh_queue_ui()
 
     def _select_quality(self, code: str) -> None:
         if code not in QUALITY_CODES:
@@ -1176,12 +1446,14 @@ class YouTubeDownloaderApp(tk.Tk):
         self._persist_theme()
         self._apply_theme()
 
-    def _bind_clipboard(self, widget: tk.Entry) -> None:
+    def _bind_clipboard(self, widget: tk.Entry, *, flatten_whitespace: bool = False) -> None:
         def paste(_event: tk.Event | None = None) -> str:
             try:
                 text = self.clipboard_get()
             except tk.TclError:
                 return "break"
+            if flatten_whitespace:
+                text = " ".join(text.replace("\r", "\n").split())
             try:
                 if widget.selection_present():
                     widget.delete("sel.first", "sel.last")
@@ -1296,7 +1568,7 @@ class YouTubeDownloaderApp(tk.Tk):
         self.after(15_000, callback)
 
     def _quit_after_update(self) -> None:
-        if self._is_downloading:
+        if self._queue_blocks_update():
             self._update_applying = False
             if self._update_info is not None:
                 self._auto_apply_update(self._update_info)
@@ -1314,7 +1586,7 @@ class YouTubeDownloaderApp(tk.Tk):
 
     def _bridge_update_extension(self, url: str | None) -> dict:
         def run() -> None:
-            if self._is_downloading:
+            if self._queue_blocks_update():
                 self._retry_update_later(run)
                 return
             try:
@@ -1323,7 +1595,7 @@ class YouTubeDownloaderApp(tk.Tk):
             except Exception as exc:
                 messagebox.showerror("Обновление", str(exc))
 
-        if self._is_downloading:
+        if self._queue_blocks_update():
             self.after(0, lambda: self._retry_update_later(run))
             return {"ok": True, "queued": True, "deferred": True}
         path = install_extension_update(url or None)
@@ -1332,12 +1604,12 @@ class YouTubeDownloaderApp(tk.Tk):
     def _bridge_update_app(self, url: str | None) -> dict:
         # Schedule UI-thread quit after updater bat is launched.
         def apply() -> None:
-            if self._is_downloading:
+            if self._queue_blocks_update():
                 self._retry_update_later(apply)
                 return
             try:
                 install_app_update(url or None, status=lambda m: self.status_var.set(m))
-                if self._is_downloading:
+                if self._queue_blocks_update():
                     self._update_applying = False
                     self._retry_update_later(apply)
                     return
@@ -1347,7 +1619,7 @@ class YouTubeDownloaderApp(tk.Tk):
                 messagebox.showerror("Обновление", str(exc))
 
         self.after(0, apply)
-        return {"ok": True, "queued": True, "deferred": bool(self._is_downloading)}
+        return {"ok": True, "queued": True, "deferred": bool(self._queue_blocks_update())}
 
     def _bridge_apply_updates(self) -> dict:
         info = fetch_update_info()
@@ -1356,7 +1628,7 @@ class YouTubeDownloaderApp(tk.Tk):
         return {
             "ok": True,
             "queued": True,
-            "deferred": bool(self._is_downloading),
+            "deferred": bool(self._queue_blocks_update()),
             "app_update": info.app_update_available,
             "extension_update": info.extension_update_available,
         }
@@ -1376,7 +1648,7 @@ class YouTubeDownloaderApp(tk.Tk):
         threading.Thread(target=worker, daemon=True, name="TubeSaveUpdateCheck").start()
 
     def _auto_apply_update(self, info) -> None:
-        if self._is_downloading:
+        if self._queue_blocks_update():
             self._retry_update_later(lambda i=info: self._auto_apply_update(i))
             return
         if self._is_busy:
@@ -1402,7 +1674,7 @@ class YouTubeDownloaderApp(tk.Tk):
 
     def _apply_updates(self, info) -> None:
         def abort_for_download() -> bool:
-            if not self._is_downloading:
+            if not self._queue_blocks_update():
                 return False
             self._update_applying = False
             self.after(0, lambda i=info: self._auto_apply_update(i))
@@ -1526,6 +1798,7 @@ class YouTubeDownloaderApp(tk.Tk):
         self._minimize_to_tray()
 
     def _quit_app(self) -> None:
+        self._cancel_event.set()
         self._stop_tray()
         bridge = getattr(self, "_bridge", None)
         if bridge is not None:
@@ -1623,7 +1896,8 @@ class YouTubeDownloaderApp(tk.Tk):
                 chip.set_selected(chip.code == self._audio_format)
             self._sync_audio_button()
 
-        self.url_var.set(url)
+        if not self._is_downloading:
+            self.url_var.set(url)
         if audio_only:
             kind = "MP3" if self._audio_format == "mp3" else "AAC"
         else:
@@ -1643,12 +1917,16 @@ class YouTubeDownloaderApp(tk.Tk):
             return
 
         if auto_start:
-            if self._is_busy:
-                self.status_var.set("Занято — ссылка вставлена, скачивание не запущено")
-                notify_windows("TubeSave", "Ссылка вставлена. Дождитесь конца текущей загрузки.")
-                return
-            notify_windows("TubeSave", f"Скачивание в фоне · {kind} · {quality_label}")
-            self._start_download(audio_only=audio_only, quiet=True)
+            self._enqueue_urls(
+                [url],
+                audio_only=audio_only,
+                quiet=True,
+                cookies=getattr(self, "_pending_cookies", "") or "",
+            )
+            waiting = self._is_downloading or len(self._pending_jobs()) > 1
+            prefix = "В очередь" if waiting else "Скачивание в фоне"
+            notify_windows("TubeSave", f"{prefix} · {kind} · {quality_label}")
+            self._pump_queue()
 
     def _show_browser_help(self) -> None:
         folder = extension_dir()
@@ -1683,24 +1961,256 @@ class YouTubeDownloaderApp(tk.Tk):
             "на странице — так подхватятся cookies сессии.",
         )
 
+    def _queue_blocks_update(self) -> bool:
+        return self._is_downloading or bool(self._pending_jobs())
+
+    def _pending_jobs(self) -> list[QueueJob]:
+        return [job for job in self._queue_jobs if job.status == "pending"]
+
+    def _finished_jobs(self) -> list[QueueJob]:
+        return [job for job in self._queue_jobs if job.status in {"done", "error", "cancelled"}]
+
+    def _queue_key(
+        self,
+        url: str,
+        audio_only: bool,
+        quality: str,
+        audio_format: str,
+        start_time: float | None = None,
+        end_time: float | None = None,
+    ) -> str:
+        fmt = normalize_audio_format(audio_format) if audio_only else ""
+        return f"{url}|{int(bool(audio_only))}|{quality}|{fmt}|{start_time}|{end_time}"
+
+    def _job_already_queued(
+        self,
+        url: str,
+        audio_only: bool,
+        quality: str,
+        audio_format: str,
+        start_time: float | None = None,
+        end_time: float | None = None,
+    ) -> bool:
+        key = self._queue_key(url, audio_only, quality, audio_format, start_time, end_time)
+        for job in self._queue_jobs:
+            if job.status not in {"pending", "running"}:
+                continue
+            if self._queue_key(
+                job.url, job.audio_only, job.quality, job.audio_format, job.start_time, job.end_time
+            ) == key:
+                return True
+        return False
+
+    def _trim_finished_jobs(self) -> None:
+        finished = self._finished_jobs()
+        extra = len(finished) - QUEUE_KEEP_FINISHED
+        if extra <= 0:
+            return
+        drop_ids = {job.id for job in finished[:extra]}
+        self._queue_jobs = [job for job in self._queue_jobs if job.id not in drop_ids]
+
+    def _enqueue_urls(
+        self,
+        urls: list[str],
+        *,
+        audio_only: bool,
+        quiet: bool,
+        cookies: str = "",
+        quality: str | None = None,
+        audio_format: str | None = None,
+        folder: Path | None = None,
+        start_time: float | None = None,
+        end_time: float | None = None,
+    ) -> int:
+        selected_quality = quality or self._quality
+        selected_format = normalize_audio_format(audio_format or self._audio_format)
+        dest = folder or Path(self.folder_var.get().strip() or str(self.download_dir))
+        added = 0
+        skipped = 0
+        for url in urls:
+            url = url.strip()
+            if not url or not is_supported_url(url):
+                continue
+            job_audio = True if "music.yandex." in url.lower() else audio_only
+            if self._job_already_queued(
+                url, job_audio, selected_quality, selected_format, start_time, end_time
+            ):
+                skipped += 1
+                continue
+            self._queue_seq += 1
+            job = QueueJob(
+                id=self._queue_seq,
+                url=url,
+                audio_only=job_audio,
+                quality=selected_quality,
+                audio_format=selected_format,
+                folder=dest,
+                cookies=cookies,
+                quiet=quiet,
+                start_time=start_time,
+                end_time=end_time,
+            )
+            self._queue_jobs.append(job)
+            added += 1
+            clip = job.trim_label()
+            extra = f", {clip}" if clip else ""
+            self._log(f"В очередь ({job.kind}, {job.quality_label()}{extra}): {url}")
+        if skipped and not added:
+            self._log("Эта ссылка уже в очереди")
+        self._trim_finished_jobs()
+        self._refresh_queue_ui()
+        return added
+
+    def _clear_pending_jobs(self) -> None:
+        if not self._pending_jobs():
+            return
+        self._queue_jobs = [job for job in self._queue_jobs if job.status != "pending"]
+        self._log("Очередь ожидания очищена")
+        self._refresh_queue_ui()
+
+    def _clear_finished_jobs(self) -> None:
+        if not self._finished_jobs():
+            return
+        self._queue_jobs = [
+            job for job in self._queue_jobs if job.status in {"pending", "running"}
+        ]
+        self._refresh_queue_ui()
+
+    def _remove_queue_job(self, job_id: int) -> None:
+        self._queue_jobs = [
+            job
+            for job in self._queue_jobs
+            if not (job.id == job_id and job.status == "pending")
+        ]
+        self._refresh_queue_ui()
+
+    def _refresh_queue_ui(self) -> None:
+        title = getattr(self, "queue_title_var", None)
+        if title is None:
+            return
+        pending = len(self._pending_jobs())
+        running = 1 if self._active_job is not None else 0
+        if running or pending:
+            title.set(f"Очередь · {running + pending}")
+        else:
+            title.set("Очередь")
+
+        for row in getattr(self, "_queue_rows", []):
+            row.destroy()
+        self._queue_rows = []
+
+        empty = getattr(self, "queue_empty_label", None)
+        jobs = list(self._queue_jobs)
+        if empty is not None:
+            if jobs:
+                empty.pack_forget()
+            else:
+                empty.configure(fg=COLORS["muted"], bg=COLORS["ghost"])
+                empty.pack(fill="x")
+
+        status_fg = {
+            "pending": COLORS["muted"],
+            "running": COLORS["accent"],
+            "done": COLORS["success"],
+            "error": COLORS["danger"],
+            "cancelled": COLORS["muted"],
+        }
+        for job in jobs:
+            row = tk.Frame(self._queue_inner, bg=COLORS["ghost"])
+            row.pack(fill="x", padx=6, pady=3)
+            self._queue_rows.append(row)
+
+            text = f"{job.title}  ·  {job.kind}"
+            if not job.audio_only:
+                text += f" {job.quality_label()}"
+            clip = job.trim_label()
+            if clip:
+                text += f"  {clip}"
+            name = tk.Label(
+                row,
+                text=text,
+                font=FONTS["small"],
+                fg=COLORS["text"],
+                bg=COLORS["ghost"],
+                anchor="w",
+            )
+            name.pack(side="left", fill="x", expand=True)
+
+            state = tk.Label(
+                row,
+                text=job.status_label(),
+                font=FONTS["small"],
+                fg=status_fg.get(job.status, COLORS["muted"]),
+                bg=COLORS["ghost"],
+                width=12,
+                anchor="e",
+            )
+            state.pack(side="right")
+
+            if job.status == "pending":
+                remove = tk.Label(
+                    row,
+                    text="×",
+                    font=FONTS["title"],
+                    fg=COLORS["muted"],
+                    bg=COLORS["ghost"],
+                    cursor="hand2",
+                    padx=8,
+                )
+                remove.pack(side="right")
+                remove.bind("<Button-1>", lambda _e, jid=job.id: self._remove_queue_job(jid))
+
+            row.bind(
+                "<MouseWheel>",
+                lambda e: self._queue_canvas.yview_scroll(int(-e.delta / 120), "units"),
+            )
+
+        self._queue_inner.update_idletasks()
+        self._queue_canvas.configure(scrollregion=self._queue_canvas.bbox("all") or (0, 0, 0, 0))
+        self._sync_action_buttons()
+
+    def _sync_action_buttons(self) -> None:
+        if getattr(self, "info_btn", None) is None:
+            return
+        fetching = self._is_busy and not self._is_downloading
+        self.info_btn.set_enabled(not self._is_busy)
+        self.download_btn.set_enabled(not fetching)
+        self.audio_btn.set_enabled(not fetching)
+        self.cancel_btn.set_enabled(self._is_downloading or bool(self._pending_jobs()))
+        clear_pending = getattr(self, "clear_queue_btn", None)
+        clear_done = getattr(self, "clear_done_btn", None)
+        if clear_pending is not None:
+            clear_pending.set_enabled(bool(self._pending_jobs()))
+        if clear_done is not None:
+            clear_done.set_enabled(bool(self._finished_jobs()))
+
     def _set_busy(self, busy: bool) -> None:
         self._is_busy = busy
         if not busy:
             self._is_downloading = False
-        enabled = not busy
-        self.info_btn.set_enabled(enabled)
-        self.download_btn.set_enabled(enabled)
-        self.audio_btn.set_enabled(enabled)
-        self.cancel_btn.set_enabled(busy)
+            self._active_job = None
+        self._sync_action_buttons()
 
     def _cancel_download(self) -> None:
-        if not self._is_busy:
+        if self._is_downloading:
+            self._cancel_event.set()
+            self.cancel_btn.set_enabled(False)
+            self.status_var.set("Отмена…")
+            self._set_stage("Отмена")
+            self._log("Отмена текущей загрузки…")
             return
-        self._cancel_event.set()
-        self.cancel_btn.set_enabled(False)
-        self.status_var.set("Отмена…")
-        self._set_stage("Отмена")
-        self._log("Отмена загрузки…")
+        if self._pending_jobs():
+            self._clear_pending_jobs()
+
+    def _pump_queue(self) -> None:
+        if self._is_busy:
+            self._sync_action_buttons()
+            return
+        next_job = next((job for job in self._queue_jobs if job.status == "pending"), None)
+        if next_job is None:
+            self._sync_action_buttons()
+            return
+        self._run_queue_job(next_job)
 
     def _log(self, message: str) -> None:
         stamp = time.strftime("%H:%M:%S")
@@ -1771,27 +2281,43 @@ class YouTubeDownloaderApp(tk.Tk):
                 self.size_var.set(f"Размер: {payload}")
             elif event == "done":
                 success, message = payload  # type: ignore[misc]
+                job = self._active_job
                 self._set_busy(False)
                 self._stop_timer()
                 self.progress.stop()
+                remaining = len(self._pending_jobs())
+                if job is not None:
+                    job.status = "done" if success else "error"
+                    job.message = str(message)
+                    if success and "\n" in str(message):
+                        saved = str(message).rsplit("\n", 1)[-1].strip()
+                        if saved:
+                            job.title = Path(saved).name
+                    self._refresh_queue_ui()
                 if success:
                     self.progress.set_value(100)
                     self.percent_var.set("100%")
                     self._set_stage("Готово")
                     self.status_var.set(message.split("\n")[0])
                     self._log(message.replace("\n", " "))
-                    notify_windows("TubeSave — готово", message)
+                    if remaining:
+                        notify_windows("TubeSave — готово", f"{message.splitlines()[0]} · ещё {remaining}")
+                    else:
+                        notify_windows("TubeSave — готово", message)
                 else:
                     self.progress.set_value(0)
                     self.percent_var.set("0%")
                     self._set_stage("Ошибка")
                     self.status_var.set("Ошибка")
                     self._log(str(message))
-                    if self._quiet_download:
+                    quiet = bool(self._quiet_download or remaining)
+                    if quiet:
                         notify_windows("TubeSave — ошибка", str(message))
                     else:
                         messagebox.showerror("Ошибка", message)
+                self._pump_queue()
             elif event == "cancelled":
+                job = self._active_job
                 self._set_busy(False)
                 self._stop_timer()
                 self.progress.stop()
@@ -1800,27 +2326,18 @@ class YouTubeDownloaderApp(tk.Tk):
                 self._set_stage("Отменено")
                 self.status_var.set("Отменено")
                 self._log(str(payload) or "Загрузка отменена")
-                if self._quiet_download:
+                if job is not None:
+                    job.status = "cancelled"
+                    job.message = str(payload or "Загрузка отменена")
+                    self._refresh_queue_ui()
+                remaining = len(self._pending_jobs())
+                if self._quiet_download or remaining:
                     notify_windows("TubeSave", "Загрузка отменена")
+                self._pump_queue()
 
         self.after(80, self._process_events)
 
-    def _validate_inputs(self, *, quiet: bool = False) -> tuple[str, Path] | None:
-        url = self.url_var.get().strip()
-        if not url:
-            if not quiet:
-                messagebox.showwarning("Ссылка", "Вставьте ссылку на видео.")
-            return None
-        if not is_supported_url(url):
-            if quiet:
-                notify_windows("TubeSave", "Неверная ссылка")
-            else:
-                messagebox.showwarning(
-                    "Ссылка",
-                    "Неверная ссылка. Поддерживаются:\n" + SUPPORTED_SITES_HINT,
-                )
-            return None
-
+    def _validate_folder(self, *, quiet: bool = False) -> Path | None:
         folder = Path(self.folder_var.get().strip())
         if not folder.exists():
             try:
@@ -1831,9 +2348,53 @@ class YouTubeDownloaderApp(tk.Tk):
                 else:
                     messagebox.showerror("Папка", f"Не удалось создать папку:\n{exc}")
                 return None
-
         self._persist_folder(folder)
-        return url, folder
+        return folder
+
+    def _read_trim_range(
+        self,
+        *,
+        quiet: bool = False,
+        urls: list[str] | None = None,
+    ) -> tuple[float | None, float | None] | None:
+        try:
+            start = parse_timestamp(self.trim_start_var.get())
+            end = parse_timestamp(self.trim_end_var.get())
+            start, end = normalize_time_range(start, end)
+        except ValueError as exc:
+            if quiet:
+                notify_windows("TubeSave", str(exc))
+            else:
+                messagebox.showwarning("Обрезка", str(exc))
+            return None
+        if start is None and urls and len(urls) == 1:
+            start = timestamp_from_url(urls[0])
+            try:
+                start, end = normalize_time_range(start, end)
+            except ValueError:
+                start = None
+        return start, end
+
+    def _validate_inputs(self, *, quiet: bool = False) -> tuple[str, Path] | None:
+        urls = extract_media_urls(self.url_var.get())
+        if not urls:
+            raw = self.url_var.get().strip()
+            if not raw:
+                if not quiet:
+                    messagebox.showwarning("Ссылка", "Вставьте ссылку на видео.")
+                return None
+            if quiet:
+                notify_windows("TubeSave", "Неверная ссылка")
+            else:
+                messagebox.showwarning(
+                    "Ссылка",
+                    "Неверная ссылка. Поддерживаются:\n" + SUPPORTED_SITES_HINT,
+                )
+            return None
+        folder = self._validate_folder(quiet=quiet)
+        if folder is None:
+            return None
+        return urls[0], folder
 
     def _fetch_info(self) -> None:
         validated = self._validate_inputs()
@@ -1889,33 +2450,79 @@ class YouTubeDownloaderApp(tk.Tk):
 
     def _start_download(self, audio_only: bool = False, *, quiet: bool = False) -> None:
         self._quiet_download = quiet
-        validated = self._validate_inputs(quiet=quiet)
-        if validated is None or self._is_busy:
+        fetching = self._is_busy and not self._is_downloading
+        if fetching:
             return
+        urls = extract_media_urls(self.url_var.get())
+        if not urls:
+            self._validate_inputs(quiet=quiet)
+            return
+        folder = self._validate_folder(quiet=quiet)
+        if folder is None:
+            return
+        trim = self._read_trim_range(quiet=quiet, urls=urls)
+        if trim is None:
+            return
+        start_time, end_time = trim
+        added = self._enqueue_urls(
+            urls,
+            audio_only=audio_only,
+            quiet=quiet,
+            cookies=getattr(self, "_pending_cookies", "") or "",
+            folder=folder,
+            start_time=start_time,
+            end_time=end_time,
+        )
+        if not added:
+            if self._job_already_queued(
+                urls[0], audio_only, self._quality, self._audio_format, start_time, end_time
+            ):
+                self.status_var.set("Уже в очереди")
+            return
+        pending = len(self._pending_jobs())
+        if self._is_downloading and pending:
+            self.status_var.set(f"Добавлено в очередь · {pending} в ожидании")
+        self._pump_queue()
 
-        url, folder = validated
+    def _run_queue_job(self, job: QueueJob) -> None:
+        self._quiet_download = job.quiet
+        self._active_job = job
+        job.status = "running"
         self._cancel_event.clear()
-        self._set_busy(True)
         self._is_downloading = True
+        self._set_busy(True)
+        self.url_var.set(job.url)
         self._reset_metrics()
         self._start_timer()
+        self._refresh_queue_ui()
         self._events.put(("progress_mode", "indeterminate"))
         self._events.put(("stage", "Подготовка"))
-        if audio_only:
-            fmt_label = "MP3" if self._audio_format == "mp3" else "AAC"
-            self._events.put(("status", f"Скачивание аудио ({fmt_label})…"))
-            self._events.put(("log", f"Аудио {fmt_label}: {url}"))
+        remaining = len(self._pending_jobs())
+        position = f" ({remaining + 1} в очереди)" if remaining else ""
+        if job.audio_only:
+            self._events.put(("status", f"Скачивание аудио ({job.kind}){position}…"))
+            self._events.put(("log", f"Аудио {job.kind}: {job.url}"))
         else:
-            quality_label = next(
-                (label for code, label in QUALITY_OPTIONS if code == self._quality),
-                self._quality,
-            )
-            self._events.put(("status", "Подготовка к скачиванию…"))
-            self._events.put(("log", f"Ссылка: {url}"))
-            self._events.put(("log", f"Качество: {quality_label}"))
+            self._events.put(("status", f"Подготовка к скачиванию{position}…"))
+            self._events.put(("log", f"Ссылка: {job.url}"))
+            self._events.put(("log", f"Качество: {job.quality_label()}"))
+        clip = job.trim_label()
+        if clip:
+            self._events.put(("log", f"Фрагмент: {clip}"))
+        info_line = f"{job.title}\n{site_label(job.url)} · {job.kind} · {job.quality_label()}"
+        if clip:
+            info_line += f" · {clip}"
+        self.info_var.set(info_line)
+        self.info_label.configure(fg=COLORS["text"])
 
-        selected_quality = self._quality
-        selected_audio_format = self._audio_format
+        url = job.url
+        folder = job.folder
+        audio_only = job.audio_only
+        selected_quality = job.quality
+        selected_audio_format = job.audio_format
+        cookies = job.cookies
+        start_time = job.start_time
+        end_time = job.end_time
 
         def status_callback(message: str) -> None:
             stage_map = {
@@ -1930,6 +2537,7 @@ class YouTubeDownloaderApp(tk.Tk):
                 "Перекодирование в MP3…": "MP3",
                 "Перекодирование AAC → MP3…": "MP3",
                 "Обход блокировки…": "Обход",
+                "Обрезка по времени…": "Обрезка",
             }
             stage = stage_map.get(message)
             if stage is None and message.startswith("Подключение к "):
@@ -1984,8 +2592,10 @@ class YouTubeDownloaderApp(tk.Tk):
                         audio_only=audio_only,
                         quality=selected_quality,
                         audio_format=selected_audio_format,
-                        cookies=getattr(self, "_pending_cookies", "") or "",
+                        cookies=cookies,
                         cancel_event=self._cancel_event,
+                        start_time=start_time,
+                        end_time=end_time,
                     )
                 size = format_bytes(filepath.stat().st_size) if filepath.exists() else "—"
                 self._events.put(("size", size))

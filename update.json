@@ -1,7 +1,7 @@
 {
-  "app": "1.3.26",
-  "extension": "1.3.26",
-  "notes": "YouTube Shorts больше не режутся: качается исходный вертикальный 1080×1920, а не 360p и не 16:9-кроп.",
+  "app": "1.4.0",
+  "extension": "1.4.0",
+  "notes": "Очередь скачивания и обрезка ролика по времени в приложении.",
   "release_page": "https://github.com/mine1510/TubeSave/releases/latest",
   "app_zip": "https://github.com/mine1510/TubeSave/releases/latest/download/TubeSave-Windows.zip",
   "extension_zip": "https://github.com/mine1510/TubeSave/releases/latest/download/TubeSave-Extension.zip"

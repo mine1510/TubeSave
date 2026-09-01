@@ -115,7 +115,7 @@
       sendDownload(url, audioOnly, quality, audioFormat)
         .then((response) => {
           if (response && response.ok) {
-            const okLabel = audioOnly ? (audioFormat === "mp3" ? "MP3" : "AAC") : "Отправлено";
+            const okLabel = audioOnly ? (audioFormat === "mp3" ? "MP3" : "AAC") : "В очередь";
             flash(anchor, okLabel, "#1B7F4B");
           } else {
             flash(anchor, "Ошибка", "#B00020");
