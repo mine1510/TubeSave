@@ -269,6 +269,17 @@ def is_youtube_url(url: str) -> bool:
     return detect_site(url) == "youtube"
 
 
+def is_youtube_shorts(url: str | None) -> bool:
+    """True for youtube.com/shorts/… (vertical original, not the 16:9 TV crop)."""
+    if not url:
+        return False
+    try:
+        path = (urlparse(url.strip()).path or "").lower()
+    except Exception:
+        return "/shorts/" in url.lower()
+    return "/shorts/" in path
+
+
 def site_label(url: str) -> str:
     site = detect_site(url)
     return SITE_LABELS.get(site or "", "Видео")
@@ -756,65 +767,58 @@ def embed_thumbnail(
     return video_path
 
 
+def _quality_bound(quality: str | None) -> int | None:
+    """Pixel cap for the shorter side, or None for unlimited."""
+    text = (quality or "best").strip().lower()
+    if text in {"best", "max", "highest"}:
+        return None
+    try:
+        value = int(text.rstrip("p"))
+    except ValueError:
+        return None
+    return value if value > 0 else None
+
+
+def format_sort_keys(quality: str = "best", *, url: str | None = None) -> list[str]:
+    """Sort by resolution first; cap '1080p' via res so vertical 1080x1920 still matches."""
+    bound = _quality_bound(quality)
+    res = f"res:{bound}" if bound else "res"
+    keys = [res]
+    if is_youtube_shorts(url):
+        # Same short-side: prefer 9:16 over a 16:9 TV crop (1080x1920 beats 1920x1080).
+        keys.append("+width")
+    # Same short-side: prefer H.264 so Explorer can show a preview.
+    keys.extend(["fps", "hdr:12", "vcodec:h264", "acodec:mp4a", "br"])
+    return keys
+
+
 def format_selector(
     *,
     audio_only: bool = False,
     quality: str = "best",
     site: str | None = None,
+    url: str | None = None,
 ) -> str:
-    """Build yt-dlp format string for video quality or audio-only."""
+    """Build yt-dlp format string for video quality or audio-only.
+
+    Quality caps live in format_sort (res:1080), not height<=1080: YouTube
+    Shorts are 1080x1920, so a height filter would drop 1080p and pick 480p.
+    """
     if audio_only:
         return "ba[ext=m4a]/ba[acodec^=mp4a]/ba/b"
-
-    quality = (quality or "best").strip().lower()
-
-    def with_height(height: int, *, prefer_avc: bool) -> str:
-        # YouTube H.264 (avc1) tops out at 1080p; 1440p/4K are VP9/AV1.
-        # Prefer AVC only when it can actually meet the requested height.
-        if prefer_avc:
-            return (
-                f"bv*[height<=?{height}][vcodec^=avc1]+ba[ext=m4a]/"
-                f"bv*[height<=?{height}]+ba[ext=m4a]/"
-                f"bv*[height<=?{height}]+ba/"
-                f"best[height<=?{height}][ext=mp4]/best[height<=?{height}]/"
-                f"bv*+ba/b"
-            )
-        return (
-            f"bv*[height<=?{height}]+ba[ext=m4a]/"
-            f"bv*[height<=?{height}]+ba/"
-            f"best[height<=?{height}]/"
-            f"bv*+ba/b"
-        )
-
-    if quality in {"best", "max", "highest"}:
-        # Highest resolution first — do not lock to H.264.
-        return "bv*+ba[ext=m4a]/bv*+ba/b"
-
-    try:
-        height = int(quality.rstrip("p"))
-    except ValueError:
-        return "bv*+ba[ext=m4a]/bv*+ba/b"
-
-    prefer_avc = site in {None, "youtube"} and height <= 1080
-    return with_height(height, prefer_avc=prefer_avc)
+    return "bv*+ba[ext=m4a]/bv*+ba/b"
 
 
 def fallback_format_selector(
     *,
     audio_only: bool = False,
     quality: str = "best",
+    url: str | None = None,
 ) -> str:
     """Looser selector that still merges best video+audio (not 360p muxed MP4)."""
     if audio_only:
         return "ba/b"
-    quality = (quality or "best").strip().lower()
-    if quality in {"best", "max", "highest"}:
-        return "bv*+ba/b"
-    try:
-        height = int(quality.rstrip("p"))
-    except ValueError:
-        return "bv*+ba/b"
-    return f"bv*[height<=?{height}]+ba/bv*+ba/b"
+    return "bv*+ba/b"
 
 
 def _ydl_storage_opts() -> dict:
@@ -1175,6 +1179,7 @@ def build_ydl_opts(
     quality: str = "best",
     audio_format: str = "aac",
     site: str | None = None,
+    url: str | None = None,
     cancel_event: Event | None = None,
     cleanup: DownloadCleanup | None = None,
     impersonate: bool = True,
@@ -1197,7 +1202,9 @@ def build_ydl_opts(
         "no_warnings": True,
         "noprogress": True,
         "restrictfilenames": False,
-        "format": format_selector(audio_only=audio_only, quality=quality, site=site),
+        "format": format_selector(
+            audio_only=audio_only, quality=quality, site=site, url=url
+        ),
         "postprocessors": [
             {
                 "key": "FFmpegThumbnailsConvertor",
@@ -1218,8 +1225,8 @@ def build_ydl_opts(
         )
     else:
         opts["merge_output_format"] = "mp4"
-        # Resolution first. At the same height prefer H.264 so Explorer can show a preview.
-        opts["format_sort"] = ["res", "fps", "hdr:12", "vcodec:h264", "acodec:mp4a", "br"]
+        # Resolution first (res:1080 caps the short side, so 1080x1920 Shorts count as 1080p).
+        opts["format_sort"] = format_sort_keys(quality, url=url)
         opts["format_sort_force"] = True
 
     js_runtimes = _ydl_js_runtimes()
@@ -1305,7 +1312,7 @@ def fetch_video_info(
         opts["impersonate"] = impersonate
     if site == "youtube":
         # Save extension cookies for later, but don't attach them on the first try.
-        # Stale/account cookies make yt-dlp skip tv/android and then fail with
+        # Account cookies make yt-dlp skip jsless clients and then fail with
         # "Requested format is not available" on many public videos.
         _ensure_youtube_cookiefile(cookies)
         opts = _with_youtube_preferred_clients(opts)
@@ -1330,7 +1337,7 @@ def fetch_video_info(
                 with _youtube_dl(retry_opts) as ydl:
                     info = ydl.extract_info(url, download=False)
             except Exception as retry_exc:
-                # Last resort: cookieless android for public videos.
+                # Last resort: cookieless jsless clients for public videos.
                 last_opts = _with_youtube_preferred_clients(_strip_youtube_cookies(dict(opts)))
                 try:
                     with _youtube_dl(last_opts) as ydl:
@@ -2128,17 +2135,37 @@ def _strip_youtube_cookies(opts: dict) -> dict:
     return result
 
 
+def _youtube_extractor_clients(attr: str, fallback: list[str]) -> list[str]:
+    """Use yt-dlp's current default clients so Shorts keep 9:16 DASH (not muxed 360p)."""
+    try:
+        from yt_dlp.extractor.youtube._video import YoutubeIE
+
+        values = getattr(YoutubeIE, attr, None)
+        if values:
+            return list(values)
+    except Exception:
+        pass
+    return list(fallback)
+
+
 def _with_youtube_preferred_clients(opts: dict) -> dict:
-    # tv/ios expose 4K DASH. android still works when those 403, but often
-    # only lists 360–1080p — keep it last so high-res formats win.
-    # Do not mix in web/mweb here: account cookies skip android/tv and drop formats.
-    return _apply_youtube_player_clients(opts, ["tv", "ios", "android"])
+    # Jsless clients (android_vr / visionos) expose original 1080x1920 Shorts.
+    # tv/ios/android currently collapse to muxed 360p (format 18). Skip web:
+    # without a JS runtime those clients fail with "format is not available".
+    return _apply_youtube_player_clients(
+        opts,
+        _youtube_extractor_clients("_DEFAULT_JSLESS_CLIENTS", ["android_vr"]),
+    )
 
 
 def _with_youtube_authed_clients(opts: dict) -> dict:
     """Clients that accept cookies (members-only / bot-check retries)."""
     return _apply_youtube_player_clients(
-        opts, ["mweb", "web_safari", "web_embedded", "tv", "web"]
+        opts,
+        _youtube_extractor_clients(
+            "_DEFAULT_AUTHED_CLIENTS",
+            ["mweb", "web_safari", "web_embedded", "tv", "web"],
+        ),
     )
 
 
@@ -2214,13 +2241,14 @@ def download_video(
             quality=quality,
             audio_format=audio_format,
             site=site,
+            url=url,
             cancel_event=cancel_event,
             cleanup=cleanup,
         )
         youtube_cookie_file = None
         youtube_used_cookies = False
         if site == "youtube":
-            # Persist cookies from the extension, but start cookieless so android works.
+            # Persist cookies from the extension, but start cookieless so DASH clients work.
             youtube_cookie_file = _ensure_youtube_cookiefile(cookies, report)
             opts = _with_youtube_preferred_clients(opts)
 
@@ -2289,10 +2317,12 @@ def download_video(
 
         if filepath is None:
             report("Обход блокировки…")
-            # Public videos: cookieless android + loose format. Cookies often break formats.
+            # Public videos: cookieless DASH client + loose format. Cookies often break formats.
             fallback = _with_youtube_preferred_clients(_strip_youtube_cookies(dict(opts)))
             fallback.pop("impersonate", None)
-            fallback["format"] = fallback_format_selector(audio_only=audio_only, quality=quality)
+            fallback["format"] = fallback_format_selector(
+                audio_only=audio_only, quality=quality, url=url
+            )
             if site == "youtube" and youtube_used_cookies:
                 # Already tried with cookies; stay cookieless.
                 pass
@@ -2319,7 +2349,7 @@ def download_video(
                     report("Повтор без cookies…")
                     bare = _with_youtube_preferred_clients(_strip_youtube_cookies(dict(fallback)))
                     bare["format"] = fallback_format_selector(
-                        audio_only=audio_only, quality=quality
+                        audio_only=audio_only, quality=quality, url=url
                     )
                     try:
                         filepath, info = _try_download(

@@ -1,7 +1,7 @@
 {
-  "app": "1.3.25",
-  "extension": "1.3.25",
-  "notes": "Исправлено качество видео: «Лучшее» и 4K больше не режутся до 1080p/360p.",
+  "app": "1.3.26",
+  "extension": "1.3.26",
+  "notes": "YouTube Shorts больше не режутся: качается исходный вертикальный 1080×1920, а не 360p и не 16:9-кроп.",
   "release_page": "https://github.com/mine1510/TubeSave/releases/latest",
   "app_zip": "https://github.com/mine1510/TubeSave/releases/latest/download/TubeSave-Windows.zip",
   "extension_zip": "https://github.com/mine1510/TubeSave/releases/latest/download/TubeSave-Extension.zip"
