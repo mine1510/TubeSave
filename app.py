@@ -616,6 +616,12 @@ class YouTubeDownloaderApp(tk.Tk):
         self._audio_format_chips: list[QualityChip] = []
         self._context_menus: list[tk.Menu] = []
         self._bg_image_labels: list[tk.Label] = []
+        self._is_downloading = False
+        self._update_deferred_logged = False
+        self._queue_jobs: list[QueueJob] = []
+        self._queue_seq = 0
+        self._active_job: QueueJob | None = None
+        self._queue_rows: list[tk.Frame] = []
 
         self._set_window_icon()
         self._build_ui()
@@ -639,12 +645,6 @@ class YouTubeDownloaderApp(tk.Tk):
         self._tray_notified = bool(self._settings.get("tray_hint_shown"))
         self._update_info = None
         self._update_applying = False
-        self._is_downloading = False
-        self._update_deferred_logged = False
-        self._queue_jobs: list[QueueJob] = []
-        self._queue_seq = 0
-        self._active_job: QueueJob | None = None
-        self._queue_rows: list[tk.Frame] = []
         self._ensure_tray()
         delay = 800 if getattr(self, "_apply_update_on_start", False) else 2500
         self.after(delay, self._check_updates_silent)
@@ -1965,10 +1965,14 @@ class YouTubeDownloaderApp(tk.Tk):
         return self._is_downloading or bool(self._pending_jobs())
 
     def _pending_jobs(self) -> list[QueueJob]:
-        return [job for job in self._queue_jobs if job.status == "pending"]
+        return [job for job in getattr(self, "_queue_jobs", []) if job.status == "pending"]
 
     def _finished_jobs(self) -> list[QueueJob]:
-        return [job for job in self._queue_jobs if job.status in {"done", "error", "cancelled"}]
+        return [
+            job
+            for job in getattr(self, "_queue_jobs", [])
+            if job.status in {"done", "error", "cancelled"}
+        ]
 
     def _queue_key(
         self,
@@ -2100,7 +2104,7 @@ class YouTubeDownloaderApp(tk.Tk):
         self._queue_rows = []
 
         empty = getattr(self, "queue_empty_label", None)
-        jobs = list(self._queue_jobs)
+        jobs = list(getattr(self, "_queue_jobs", []))
         if empty is not None:
             if jobs:
                 empty.pack_forget()

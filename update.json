@@ -1,7 +1,7 @@
 {
-  "app": "1.4.0",
-  "extension": "1.4.0",
-  "notes": "Очередь скачивания и обрезка ролика по времени в приложении.",
+  "app": "1.4.1",
+  "extension": "1.4.1",
+  "notes": "Исправлена ошибка запуска после добавления очереди.",
   "release_page": "https://github.com/mine1510/TubeSave/releases/latest",
   "app_zip": "https://github.com/mine1510/TubeSave/releases/latest/download/TubeSave-Windows.zip",
   "extension_zip": "https://github.com/mine1510/TubeSave/releases/latest/download/TubeSave-Extension.zip"
