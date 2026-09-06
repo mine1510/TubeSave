@@ -491,9 +491,14 @@ def site_label(url: str) -> str:
 
 def get_ffmpeg_location() -> str:
     import imageio_ffmpeg
+    from yt_dlp.postprocessor.ffmpeg import FFmpegPostProcessor
 
     # Full path to the binary (imageio names it ffmpeg-win-*.exe, not ffmpeg.exe)
-    return imageio_ffmpeg.get_ffmpeg_exe()
+    location = imageio_ffmpeg.get_ffmpeg_exe()
+    # yt-dlp's FFmpegFD.available() builds FFmpegPostProcessor without YoutubeDL,
+    # so it ignores ffmpeg_location in opts and only sees this ContextVar / PATH.
+    FFmpegPostProcessor._ffmpeg_location.set(location)
+    return location
 
 
 _PROXY_ENV_KEYS = (

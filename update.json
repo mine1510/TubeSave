@@ -1,7 +1,7 @@
 {
-  "app": "1.4.1",
-  "extension": "1.4.1",
-  "notes": "Исправлена ошибка запуска после добавления очереди.",
+  "app": "1.4.2",
+  "extension": "1.4.2",
+  "notes": "Исправлена обрезка по времени: встроенный ffmpeg снова находится.",
   "release_page": "https://github.com/mine1510/TubeSave/releases/latest",
   "app_zip": "https://github.com/mine1510/TubeSave/releases/latest/download/TubeSave-Windows.zip",
   "extension_zip": "https://github.com/mine1510/TubeSave/releases/latest/download/TubeSave-Extension.zip"

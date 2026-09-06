@@ -991,7 +991,7 @@ class YouTubeDownloaderApp(tk.Tk):
 
         trim_hint = tk.Label(
             quality_inner,
-            text="Только в приложении. Пусто = целиком. Формат: 1:20, 1:20:05 или 90.",
+            text="Только в приложении. Пустое «С» — с начала, пустое «По» — до конца. Формат: 1:20, 1:20:05 или 90.",
             font=FONTS["small"],
             fg=COLORS["muted"],
             bg=COLORS["surface"],
