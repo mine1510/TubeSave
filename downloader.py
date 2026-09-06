@@ -22,6 +22,10 @@ from urllib.request import Request, urlopen
 
 import yt_dlp
 
+from dns_fix import install_doh_dns
+
+install_doh_dns()
+
 
 ProgressCallback = Callable[[dict], None]
 StatusCallback = Callable[[str], None]
@@ -581,6 +585,21 @@ def _is_proxy_error(message: str) -> bool:
     )
 
 
+def _is_dns_error(message: str) -> bool:
+    lower = (message or "").lower()
+    return any(
+        needle in lower
+        for needle in (
+            "could not resolve host",
+            "curl: (6)",
+            "failed to perform, curl: (6)",
+            "getaddrinfo failed",
+            "name or service not known",
+            "nodename nor servname",
+        )
+    )
+
+
 def _proxy_error() -> RuntimeError:
     return RuntimeError(
         "Сетевая ошибка: TubeSave пытался ходить через локальный прокси "
@@ -590,6 +609,15 @@ def _proxy_error() -> RuntimeError:
         "2. Выключите системный прокси в Windows "
         "(Параметры → Сеть и Интернет → Прокси) и в клиенте Clash/V2Ray.\n"
         "3. Перезапустите TubeSave и скачайте снова."
+    )
+
+
+def _dns_error() -> RuntimeError:
+    return RuntimeError(
+        "Не удалось найти сервер YouTube (ошибка DNS).\n\n"
+        "Провайдер или фильтр блокирует обычный DNS для youtube.com.\n"
+        "Попробуйте VPN/DNS (1.1.1.1 или 8.8.8.8) или откройте ролик "
+        "через расширение TubeSave в браузере."
     )
 
 
@@ -1367,6 +1395,8 @@ def _reraise_youtube_error(exc: Exception) -> None:
     message = str(exc)
     if _is_proxy_error(message):
         raise _proxy_error() from None
+    if _is_dns_error(message):
+        raise _dns_error() from None
     if _is_youtube_bot_check(message):
         raise _youtube_bot_error() from None
     raise exc
@@ -1376,6 +1406,8 @@ def _reraise_download_error(exc: Exception) -> None:
     message = str(exc)
     if _is_proxy_error(message):
         raise _proxy_error() from None
+    if _is_dns_error(message):
+        raise _dns_error() from None
     raise exc
 
 

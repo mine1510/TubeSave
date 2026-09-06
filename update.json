@@ -1,7 +1,7 @@
 {
-  "app": "1.4.2",
-  "extension": "1.4.2",
-  "notes": "Исправлена обрезка по времени: встроенный ffmpeg снова находится.",
+  "app": "1.4.3",
+  "extension": "1.4.3",
+  "notes": "Обход блокировки DNS YouTube через DNS-over-HTTPS.",
   "release_page": "https://github.com/mine1510/TubeSave/releases/latest",
   "app_zip": "https://github.com/mine1510/TubeSave/releases/latest/download/TubeSave-Windows.zip",
   "extension_zip": "https://github.com/mine1510/TubeSave/releases/latest/download/TubeSave-Extension.zip"
